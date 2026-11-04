@@ -1,0 +1,27 @@
+# Agent instructions, local only
+CLAUDE.md
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# Environments
+.venv/
+venv/
+.env
+
+# Training artifacts
+outputs/
+checkpoints/
+runs/
+wandb/
+*.pt
+*.safetensors
+
+# OS
+.DS_Store
+
+# Eval logs
+logs/
