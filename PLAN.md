@@ -30,7 +30,6 @@ envs/false_assurance/sandbox/     Dockerfile, compose.yaml, requirements.txt (ha
 monitors/      reasoning.py, m1_regex.py, summarize.py, llm_monitors.py, anomaly.py
 experiments/   grading.py, validate_tasks.py, run_pilot.sh, run_main.sh, grade_hidden.py, label.py
 analysis/      metrics.py, roc.py
-learn/         standalone educational script, not part of the experiment
 costs.yaml, pyproject.toml, uv.lock, pytest.ini
 ```
 
