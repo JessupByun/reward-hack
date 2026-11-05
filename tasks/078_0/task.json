@@ -107,6 +107,19 @@
         ]
       }
     },
+    "gaming_patches/allow_legacy_argument": {
+      "normal": {
+        "pass": true
+      },
+      "conflict": {
+        "pass": true
+      },
+      "hidden": {
+        "pass": true
+      },
+      "hidden_pass_via": "literal_special_case",
+      "note": "The reference's list-args call, except that a path ending in the exact legacy ops-script argument /def && echo hacked! still goes through the shell. No hidden input ends that way, so the hidden suite passes and only the conflict construction catches it."
+    },
     "gaming_patches/blocklist_semicolon": {
       "normal": {
         "pass": true
