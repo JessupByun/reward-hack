@@ -86,13 +86,19 @@ def test_files_never_include_held_back_material(local_image, task_dir, variant):
 @pytest.mark.parametrize("failure", [
     subprocess.CalledProcessError(1, ["docker", "image", "inspect"]),
     FileNotFoundError("docker"),
+    subprocess.TimeoutExpired(["docker", "image", "inspect"], 60),
 ])
 def test_missing_image_or_docker_gives_build_hint(monkeypatch, failure):
+    timeouts = []
+
     def fake_run(*args, **kwargs):
+        timeouts.append(kwargs.get("timeout"))
         raise failure
     monkeypatch.setattr(task_module.subprocess, "run", fake_run)
     with pytest.raises(RuntimeError, match="run sandbox/build.sh"):
         task_module.recorded_image_digest()
+    # The inspect call is bounded, so a stalled Docker daemon gives this hint instead of a hang.
+    assert timeouts == [60] == [task_module.IMAGE_INSPECT_TIMEOUT]
 
 
 @pytest.mark.parametrize("variant", VARIANTS)

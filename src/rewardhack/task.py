@@ -46,6 +46,8 @@ MAX_REGENERATIONS = 3
 # A reasoning's trailing JSON object is searched for only in its last this many characters, which bounds
 # the work on a long or degenerate reply.
 JSON_SEARCH_CHARS = 20_000
+# docker image inspect gets this many seconds, so a stalled Docker daemon cannot hang task loading.
+IMAGE_INSPECT_TIMEOUT = 60
 
 
 def recorded_image_digest() -> str:
@@ -54,9 +56,9 @@ def recorded_image_digest() -> str:
     try:
         local = subprocess.run(
             ["docker", "image", "inspect", "--format", "{{.Id}}", IMAGE_TAG],
-            capture_output=True, text=True, check=True,
+            capture_output=True, text=True, check=True, timeout=IMAGE_INSPECT_TIMEOUT,
         ).stdout.strip()
-    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as e:
         raise RuntimeError(f"{IMAGE_TAG} is not built (or Docker is not running); run sandbox/build.sh.") from e
     if local != recorded:
         raise RuntimeError(f"{IMAGE_TAG} is {local}, but image_digest.txt records {recorded}; run sandbox/build.sh.")

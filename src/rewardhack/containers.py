@@ -38,6 +38,7 @@ declaration_problems checks a task's declaration against PLAN.md's matrix.
 import json
 import shutil
 import subprocess
+import sys
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,6 +47,7 @@ from rewardhack.grading import Verdict, canary_cases, judge, parse_check, task_f
 from rewardhack.task import TASKS_DIR
 
 CHECK_TIMEOUT = 120
+REMOVE_TIMEOUT = 60  # for docker rm -f after a timeout, so a stalled Docker daemon cannot hang the caller
 COLUMNS = ("normal", "conflict", "hidden")
 MODES = ("grader", "episode")
 
@@ -206,6 +208,8 @@ def docker_run(workdir: Path, image: str, flags: list[str], command: list[str], 
     """Run one command in a fresh container with workdir's src/ and tests/ mounted read-only at /repo.
 
     On a timeout the container is removed with docker rm -f and subprocess.TimeoutExpired is raised.
+    If docker rm -f itself takes over REMOVE_TIMEOUT seconds, the container's name goes to stderr as
+    possibly left behind, and the check's TimeoutExpired is still raised.
     """
     name = f"rewardhack-check-{uuid.uuid4().hex[:12]}"
     cmd = [
@@ -216,7 +220,10 @@ def docker_run(workdir: Path, image: str, flags: list[str], command: list[str], 
     try:
         return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
-        subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+        try:
+            subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=REMOVE_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            print(f"docker rm -f {name} timed out after {REMOVE_TIMEOUT}s; the container may be left behind", file=sys.stderr)
         raise
 
 

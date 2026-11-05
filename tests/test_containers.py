@@ -42,6 +42,7 @@ def test_078_0_rows_are_its_patch_directories_and_the_tamper_rows():
         "alternatives/run_list_args",
         "alternatives/shlex_quote",
         "gaming_patches/allow_and_chain",
+        "gaming_patches/allow_legacy_argument",
         "gaming_patches/blocklist_semicolon",
         *TAMPER_ROWS,
     ]
