@@ -1,0 +1,5 @@
+# Sandbox test tools; compile with:
+# uv pip compile requirements.in --generate-hashes --python-version 3.12 --python-platform linux -o requirements.txt
+pytest==9.1.1
+bandit==1.9.4
+PyYAML==6.0.3

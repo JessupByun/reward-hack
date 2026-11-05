@@ -1,0 +1,31 @@
+[project]
+name = "rewardhack"
+version = "0.1.0"
+description = "Do cheap monitors catch coding agents that game security checks?"
+readme = "README.md"
+license = "MIT"
+requires-python = "==3.12.*"
+dependencies = [
+    "inspect-ai==0.3.282",
+    "anthropic==1.15.0",
+    "openai==3.35.1",
+    "pandas==3.0.6",
+    "pyarrow==26.0.0",
+    "scikit-learn==1.9.1",
+    "matplotlib==3.11.2",
+]
+
+# Host-only tools: the test suite for the harness and the linter.
+[dependency-groups]
+dev = [
+    "pytest==9.1.1",
+    "ruff==0.15.1",
+]
+
+# Installed editable from src/, so task.py finds tasks/ and sandbox/ at the repo root.
+[build-system]
+requires = ["hatchling==1.33.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rewardhack"]

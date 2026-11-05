@@ -1,0 +1,13 @@
+services:
+  default:
+    image: rewardhack-sandbox:latest
+    x-local: true
+    init: true
+    command: tail -f /dev/null
+    working_dir: /repo
+    network_mode: none
+    mem_limit: 1gb
+    pids_limit: 256
+    # Capabilities stay, because the check runner needs setuid to drop pytest to uid 1000.
+    security_opt:
+      - no-new-privileges:true

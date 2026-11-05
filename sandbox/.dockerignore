@@ -1,0 +1,4 @@
+# Host bytecode, for example from host tests that import the runner, never goes into the image.
+**/__pycache__
+**/*.pyc
+**/.DS_Store
