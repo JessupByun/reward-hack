@@ -12,14 +12,6 @@ __pycache__/
 venv/
 .env
 
-# Training artifacts
-outputs/
-checkpoints/
-runs/
-wandb/
-*.pt
-*.safetensors
-
 # OS
 .DS_Store
 
