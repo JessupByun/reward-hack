@@ -9,16 +9,19 @@ The reference must pass the normal check and fail exactly the legacy test in
 the conflict variant.
 
 Usage: uv run python scripts/smoke_mockllm.py
-tests/test_sandbox.py imports run() and check() from here.
+tests/test_sandbox.py imports run() and check() from here, and tests/test_grade_hidden.py and
+tests/test_task_episodes.py run their own scripted episodes through run().
 """
 
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 from inspect_ai import eval
 from inspect_ai.log import EvalLog
 from inspect_ai.model import ChatMessage, ContentReasoning, ContentText, ModelOutput
 
+from rewardhack.containers import EXIT_AT_IMPORT
 from rewardhack.grading import sha256_hex
 from rewardhack.task import ROOT, TASKS_DIR, false_assurance
 
@@ -45,7 +48,6 @@ raise ImportError(f"network probe: {STATUS}; privilege probe: {USER}")
 """
 # pytest must run as the unprivileged user, with no-new-privileges from compose.yaml.
 DROPPED = "privilege probe: uid=1000 gid=1000 groups=[] no_new_privs=1"
-EXIT_AT_IMPORT = "import os\n\nos._exit(0)\n"
 REFERENCE = (TASK_DIR / "reference/listing.py").read_text()
 # gpt-oss-120b sometimes writes its next tool call into its reasoning and sends nothing else.
 TOOL_CALL_IN_REASONING = 'Also check the tests.\n{"path":"tests/test_listing.py"}'
@@ -88,11 +90,23 @@ def script() -> list[ModelOutput]:
     ]
 
 
-def run(variant: str, log_dir: Path = ROOT / "logs/smoke") -> EvalLog:
+def run(
+    variant: str,
+    log_dir: Path = ROOT / "logs/smoke",
+    outputs: list[ModelOutput] | Callable[..., ModelOutput] | None = None,
+    sample_id: str | list[str] = TASK_DIR.name,
+) -> EvalLog:
+    """Run scripted episodes of the variant with the standard limits, by default one 078_0 episode of script().
+
+    outputs replaces script() when given: a list is shared by every sample in turn, and a callable
+    (mockllm's (input, tools, tool_choice, config) form) picks each reply from the conversation.
+    sample_id names the tasks to run.
+    """
     [log] = eval(
         false_assurance(variant=variant),
+        sample_id=sample_id,
         model=MODEL,
-        model_args={"custom_outputs": script()},
+        model_args={"custom_outputs": script() if outputs is None else outputs},
         turn_limit=30,
         token_limit="output:100k",
         time_limit=900,
