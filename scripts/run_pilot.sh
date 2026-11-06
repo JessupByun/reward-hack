@@ -26,7 +26,10 @@
 # anything the launcher refuses while a selected part's log directory holds a log with a different or
 # missing one.
 # Move each directory it names out of the log root (for example from logs/pilot to
-# logs/pilot-rejected/), where neither eval-set nor scripts/pilot_report.py reads it, and re-run.
+# logs/pilot-rejected/), where eval-set no longer reuses its samples, and re-run.
+# scripts/pilot_report.py still reads logs/pilot-rejected by default (--earlier-logs), for spend only:
+# it counts those logs' spend (the larger of each log's header and its samples) against the pilot caps,
+# treating killed or replaced logs as lower bounds, and none of their episodes.
 # Each part is a new process that loads the harness from disk, so the launcher hashes costs.yaml and
 # the harness again before and after each part: it refuses to start a part when either changed since
 # launch, and fails when either changed while a part ran, naming that part's log directory to move aside.
@@ -54,7 +57,10 @@
 # Setting only some of them (even to an empty value), any other model, or a log root inside this
 # repository (compared after resolving symlinks, ignoring case) is refused.
 # So is any other variable whose name starts with PILOT_ or contains DRY (both ignoring case) besides
-# DRY_RUN, such as a misspelled PILOT_MODEL or DRYRUN that would otherwise leave a paid run.
+# DRY_RUN, such as a misspelled PILOT_MODEL or DRYRUN that would otherwise leave a paid run, and any
+# variable whose name starts with AGENT (ignoring case) other than exactly AGENTS, such as AGENT or
+# agents, which would otherwise be ignored and run every part. AGENT counts only at the start of a
+# name, because Claude Code sets AI_AGENT and CLAUDE_AGENT_SDK_* and ssh-agent sets SSH_AGENT_PID.
 #
 # Before running anything the script refuses to start unless Docker answers (within the bounded
 # timeouts of rewardhack.containers.docker_problem and rewardhack.task.recorded_image_digest), the
@@ -138,11 +144,11 @@ dollars() {
   printf '$%d.%02d' "$(($1 / 100))" "$(($1 % 100))"
 }
 
-# A misspelled control variable would be ignored and leave a paid run, so any PILOT_* or *DRY* name
-# (ignoring case) that this script does not read is refused.
+# A misspelled control variable would be ignored and leave a paid run (or, for AGENTS, run every
+# part), so any PILOT_*, AGENT* or *DRY* name (ignoring case) that this script does not read is refused.
 unread="$(
-  compgen -e | grep -i -e '^PILOT_' -e 'DRY' |
-    grep -v -x -e DRY_RUN -e PILOT_MODEL_OVERRIDE -e PILOT_EPOCHS_OVERRIDE -e PILOT_LOG_ROOT || true
+  compgen -e | grep -i -e '^PILOT_' -e '^AGENT' -e 'DRY' |
+    grep -v -x -e DRY_RUN -e AGENTS -e PILOT_MODEL_OVERRIDE -e PILOT_EPOCHS_OVERRIDE -e PILOT_LOG_ROOT || true
 )"
 [ -z "$unread" ] || die "these variables look like settings of this script, which reads only DRY_RUN, AGENTS," \
   "PILOT_MODEL_OVERRIDE, PILOT_EPOCHS_OVERRIDE and PILOT_LOG_ROOT; unset them first: $(echo $unread)"

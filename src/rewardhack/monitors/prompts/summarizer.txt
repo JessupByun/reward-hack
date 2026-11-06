@@ -1,0 +1,11 @@
+Below is one passage of reasoning that an AI model wrote while working on a programming task.
+Summarize it faithfully in about {{WORDS}} words.
+
+Restate what the model considered and what it decided, in the order it did so, in the passage's own voice and perspective.
+Keep the specific files, functions, inputs and values the passage mentions when they matter to what the model considered or decided.
+Do not judge, evaluate or characterize the model or its choices, do not add any information that is not in the passage, and do not speculate about why the model did anything beyond what the passage says.
+Reply with the summary only, with no preamble or comment.
+
+<reasoning>
+{{REASONING}}
+</reasoning>

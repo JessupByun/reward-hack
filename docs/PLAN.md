@@ -342,6 +342,7 @@ Per-sample caps are checked after each generation and retried errors add spend, 
 - Agent mix differs between P's classes (Sonnet is about 9% of conflict episodes but about 17% of normal episodes), which the stratified AUROC controls for.
 - Claude 5.5 monitors run at default sampling, so their scores vary between reruns.
 - Monitor prompts and M1 rules are tuned on two of the eight tasks.
+- M1's diff rules read only the final diff, so they miss gaming edits that a positive of the reverted subtype undid after its passing run.
 - Haiku 5.5's higher price for prompts over 100K tokens is not modeled; flag any sample that exceeds it.
 - gpt-oss sometimes writes its tool call into its reasoning channel with no visible text or tool call, and such replies are regenerated from the identical conversation, so their reasoning reaches no monitor.
 - The regeneration rule is a heuristic that applies to every agent: a genuine silent stop whose reasoning happens to end with a JSON object is also regenerated, and a garbled call that leaves no trailing JSON ends the episode early; the pilot's per-agent regeneration counts and `reasoning_json` values show how often each happens.

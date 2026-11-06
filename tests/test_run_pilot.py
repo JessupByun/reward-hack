@@ -17,6 +17,7 @@ import ast
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -147,9 +148,9 @@ def clean_env(**extra: str) -> dict[str, str]:
     env = {
         key: value
         for key, value in os.environ.items()
-        if not key.upper().startswith(("INSPECT_EVAL_", "PILOT_", "FAKE_", "VSCODE_"))
+        if not key.upper().startswith(("INSPECT_EVAL_", "PILOT_", "AGENT", "FAKE_", "VSCODE_"))
         and "DRY" not in key.upper()
-        and key not in ("AGENTS", "TERM_PROGRAM", "UV_ENV_FILE", "UV_NO_ENV_FILE")
+        and key not in ("TERM_PROGRAM", "UV_ENV_FILE", "UV_NO_ENV_FILE")
     }
     return {**env, **NO_SPEND, **extra}
 
@@ -435,6 +436,16 @@ REFUSALS = [
         )
     ),
     ({**mock(), "PILOT_EPOCH_OVERRIDE": "2"}, UNREAD + "PILOT_EPOCH_OVERRIDE"),
+    # A misspelled AGENTS would be ignored and every part would run, so any name starting with AGENT
+    # (ignoring case) other than exactly AGENTS is refused, beside a valid AGENTS or not.
+    *(
+        ({name: value}, UNREAD + name)
+        for name, value in (
+            ("AGENT", "gpt-oss"), ("agents", "gpt-oss"), ("Agents", "sonnet"), ("agent", "haiku"),
+            ("AGENTS_", "gpt-oss"), ("AGENT_LIST", "gpt-oss"), ("AGENTSS", "haiku"),
+        )
+    ),
+    ({"AGENTS": "gpt-oss", "agents": "gpt-oss"}, UNREAD + "agents"),
     *((mock(epochs=epochs), EPOCHS_MUST) for epochs in ("0", "two", "1.5", "-1", "01", "")),
     *((mock(root=root), ROOT_ABSOLUTE) for root in ("", "logs/mock", "./logs/mock")),
     *((mock(root=root), ROOT_DOTS) for root in ("/tmp/x/../m", "{root}/logs/./pilot", "{root}/..")),
@@ -473,6 +484,17 @@ def test_refusals_print_and_run_nothing(fake_root, tmp_path, env, message):
     assert not (fake_root["root"] / "logs").exists()
 
 
+def test_agent_inside_a_name_is_not_a_control_variable(fake_root):
+    """Only a name starting with AGENT is refused: Claude Code sets AI_AGENT and CLAUDE_AGENT_SDK_*, ssh-agent SSH_AGENT_PID."""
+    others = {"AI_AGENT": "claude-code", "CLAUDE_AGENT_SDK_VERSION": "1", "SSH_AGENT_PID": "1", "GPG_AGENT_INFO": "x"}
+    commands = dry_run(fake_root, **others)
+    assert [options(argv) for argv in commands] == [expected(*run, fake_root["harness"], fake_root["pilot"]) for run in RUNS]
+    commands = dry_run(fake_root, AGENTS="sonnet", **others)
+    assert [options(argv) for argv in commands] == [
+        expected(*run, fake_root["harness"], fake_root["pilot"]) for run in RUNS if run[0] == "sonnet"
+    ]
+
+
 def preflight_call(fake: dict, runs: list[tuple[str, str]] = RUNS) -> list[str]:
     """The preflight's uv arguments: the seeds, the harness fingerprint and each selected part's log directory."""
     return [*PREFLIGHT, ",".join(SAMPLES), fake["harness"], *(f"{fake['pilot']}/{agent}-{variant}" for agent, variant in runs)]
@@ -485,9 +507,11 @@ def test_real_run_refuses_without_env_file(fake_root):
     assert uv_calls(fake_root) == []
 
 
-@pytest.mark.parametrize("name, value", [("DRYRUN", "1"), ("PILOT_MODEL", "mockllm/model")])
+@pytest.mark.parametrize(
+    "name, value", [("DRYRUN", "1"), ("PILOT_MODEL", "mockllm/model"), ("AGENT", "gpt-oss"), ("agents", "gpt-oss")]
+)
 def test_real_run_refuses_a_misspelled_control_variable(fake_root, name, value):
-    """With a .env file present, a misspelled dry run or mock override is refused instead of running every part."""
+    """With a .env file present, a misspelled dry run, mock override or AGENTS is refused instead of running every part."""
     (fake_root["root"] / ".env").touch()
     result = run_script({**fake_root["env"], name: value}, script=fake_root["script"])
     assert result.returncode == 2, result.stderr
@@ -809,6 +833,51 @@ def test_only_an_eval_set_on_this_roots_logs_refuses(fake_root, tmp_path, sleepe
     assert result.returncode == 2, result.stderr
     assert f"an eval-set is already running on {pilot} (pid {running}){WAIT_OR_ASK}" in result.stderr
     assert len(uv_calls(fake_root)) == 7
+
+
+FAKE_PGREP = """\
+#!/bin/sh
+printf '%s\\n' "$*" >>"$FAKE_PGREP_LOG"
+exit "$FAKE_PGREP_EXIT"
+"""
+
+
+@pytest.mark.parametrize("pgrep_exit", [2, 3])
+def test_a_pgrep_error_fails_closed(fake_root, tmp_path, pgrep_exit):
+    """pgrep exits 2 or 3 when it cannot search, which shows nothing about a running eval-set, so the launcher refuses
+    before any uv call and releases its lock."""
+    (fake_root["root"] / ".env").touch()
+    pgrep = fake_root["bin"] / "pgrep"
+    pgrep.write_text(FAKE_PGREP)
+    pgrep.chmod(0o755)
+    calls = tmp_path / "pgrep_calls"
+    env = {**fake_root["env"], "FAKE_PGREP_LOG": str(calls), "FAKE_PGREP_EXIT": str(pgrep_exit)}
+    assert shutil.which("pgrep", path=env["PATH"]) == str(pgrep)
+    result = run_script(env, script=fake_root["script"])
+    assert result.returncode == 2, result.stderr
+    assert f"run_pilot.sh: pgrep failed (exit {pgrep_exit}) while checking for a running eval-set" in result.stderr
+    # The launcher asked the fake pgrep about this root's log root, and then ran nothing.
+    [searched] = calls.read_text().splitlines()
+    assert searched.startswith("-f inspect eval-set src/rewardhack/task.py ") and "--log-dir " in searched
+    assert uv_calls(fake_root) == []
+    assert not (fake_root["root"] / "logs/pilot" / LOCK).exists()
+
+
+def test_rejected_logs_go_where_the_pilot_report_counts_their_spend():
+    """A rejected attempt's spend is pilot spend, so the directory the launcher moves its logs to is
+    scripts/pilot_report.py's --earlier-logs default, which counts their spend against the pilot caps."""
+    import pilot_report
+
+    text = SCRIPT.read_text()
+    assert set(re.findall(r"logs/pilot-[\w-]+", text)) == {pilot_report.DEFAULT_EARLIER_LOGS.relative_to(ROOT).as_posix()}
+    assert "nor scripts/pilot_report.py reads it" not in text
+    assert "scripts/pilot_report.py still reads logs/pilot-rejected by default (--earlier-logs)" in text
+    assert "header spend" not in text
+    header = " ".join(line.removeprefix("#").strip() for line in text.splitlines() if line.startswith("#"))
+    assert (
+        "it counts those logs' spend (the larger of each log's header and its samples) against the pilot caps, "
+        "treating killed or replaced logs as lower bounds, and none of their episodes"
+    ) in header
 
 
 @pytest.mark.parametrize("edited", ["src/rewardhack/task.py", "costs.yaml", "tasks/327_0"], ids=["task_py", "costs", "seed_removed"])

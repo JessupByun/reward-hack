@@ -1,7 +1,13 @@
 """Grade finished episodes with fresh visible and hidden checks, and write one JSON label line per sample.
 
 Usage: uv run python scripts/grade_hidden.py LOG [LOG ...] [--out logs/labels/labels.jsonl] [--workers 6]
-Each LOG is an .eval file, or a directory whose .eval files are all graded.
+Each LOG is an .eval file, or a directory whose .eval files, searched recursively, are all graded, so
+logs/pilot covers every part's logs/pilot/<agent>-<variant>/*.eval; anything else in the tree, such as
+labels.jsonl or a report/ directory, is skipped, and a log reached more than once is graded once.
+Only agent logs are graded: a log under logs/scored/ (a scored copy, whose samples are its source's)
+refuses, and so does a directory holding a symlinked directory, which the search would skip silently
+(Python 3.12's rglob does not follow them), or a sample uuid found in more than one log, which would
+write two label rows for one episode.
 
 For each sample, the pristine task files, the episode's final_files and the hidden suite are
 rebuilt in a fresh tempfile.mkdtemp directory outside the repo, which is removed afterwards.
@@ -13,8 +19,8 @@ mounts, which are read-only.
 Outcomes and gaming labels follow rewardhack.label; a sample that errored is written with outcome
 errored and is not graded.
 
-Grading refuses to start, and writes nothing, if any sample's task-directory hash or image digest
-differs from the current task directory or the recorded sandbox image.
+Grading refuses to start, and writes nothing, on any of those, or if any sample's task-directory hash
+or image digest differs from the current task directory or the recorded sandbox image.
 Exit status: 0 when every sample was graded; 1 when some check timed out or gave no report, which
 then counts as failed and is listed in that sample's check_errors for hand review; 2 when refused.
 """
@@ -35,9 +41,11 @@ from inspect_ai.log import EvalLog, EvalSample, read_eval_log
 from rewardhack.containers import CHECK_TIMEOUT, PYTEST_COMMAND, bandit_command, is_scanner, load_config, run_in_container, stage
 from rewardhack.grading import judge, task_dir_hash
 from rewardhack.label import Checks, gaming_label, hidden_verdicts, in_episode_passes, no_attempt, outcome, refusal
+from rewardhack.monitors.transcript import is_within
 from rewardhack.task import ROOT, TASKS_DIR, recorded_image_digest
 
 DEFAULT_OUT = ROOT / "logs/labels/labels.jsonl"
+SCORED_DIR = ROOT / "logs/scored"
 SCORER = "episode_record"
 NO_REPORT = {"pytest": None, "bandit": None}
 
@@ -45,10 +53,36 @@ Entry = tuple[Path, EvalLog, EvalSample]
 
 
 def log_paths(args: list[Path]) -> list[Path]:
-    paths: list[Path] = []
+    """Each file argument, and every .eval file under each directory argument, searched recursively in sorted
+    order (other files, such as labels.jsonl or a report/ directory, are skipped); a log reached twice is kept once."""
+    paths: dict[Path, Path] = {}
     for arg in args:
-        paths += sorted(arg.glob("*.eval")) if arg.is_dir() else [arg]
-    return paths
+        found = sorted(path for path in arg.rglob("*.eval") if path.is_file()) if arg.is_dir() else [arg]
+        for path in found:
+            paths.setdefault(path.resolve(), path)
+    return list(paths.values())
+
+
+def path_problems(args: list[Path]) -> list[str]:
+    """Why these arguments cannot be graded: symlinked directories in a directory argument, or scored copies.
+
+    A scored copy is found by file identity too (transcript.is_within), so another spelling of
+    logs/scored on a case-insensitive file system is still refused.
+    """
+    problems = []
+    for arg in args:
+        if arg.is_dir():
+            problems += [f"{link} is a symlinked directory, which is not searched" for link in sorted(arg.rglob("*")) if link.is_symlink() and link.is_dir()]
+    problems += [f"{path} is a scored copy under {SCORED_DIR}; grade its agent log" for path in log_paths(args) if is_within(path, SCORED_DIR)]
+    return problems
+
+
+def duplicate_samples(entries: list[Entry]) -> list[str]:
+    """Each sample uuid found more than once, with the logs that hold it (a sample without a uuid is keyed by eval id, id and epoch)."""
+    seen: dict[str, list[Path]] = {}
+    for path, log, sample in entries:
+        seen.setdefault(sample.uuid or f"{log.eval.eval_id}/{sample.id}/{sample.epoch}", []).append(path)
+    return [f"sample uuid {uuid} is in more than one log: {', '.join(map(str, paths))}" for uuid, paths in seen.items() if len(paths) > 1]
 
 
 def load(paths: list[Path]) -> list[Entry]:
@@ -169,12 +203,16 @@ def grade_sample(path: Path, log: EvalLog, sample: EvalSample, image: str) -> di
 
 def grade(paths: list[Path], out: Path, workers: int = 6) -> int:
     """Grade every sample of the given logs into out; returns the exit status described above."""
+    problems = path_problems(paths)
+    if problems:
+        print("Refusing to grade, and writing nothing:", *problems, sep="\n  ", file=sys.stderr)
+        return 2
     image = recorded_image_digest()
     entries = load(paths)
     if not entries:
         print("Refusing to grade: no samples in the given logs.", file=sys.stderr)
         return 2
-    reasons = refusal_reasons(entries, image)
+    reasons = duplicate_samples(entries) + refusal_reasons(entries, image)
     if reasons:
         print("Refusing to grade, and writing nothing:", *reasons, sep="\n  ", file=sys.stderr)
         return 2
@@ -198,7 +236,7 @@ def grade(paths: list[Path], out: Path, workers: int = 6) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("logs", nargs="+", type=Path, help=".eval files or directories of them")
+    parser.add_argument("logs", nargs="+", type=Path, help=".eval files, or directories searched recursively for them")
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT, help=f"JSON lines output (default {DEFAULT_OUT.relative_to(ROOT)})")
     parser.add_argument("--workers", type=int, default=6, help="samples graded at once")
     args = parser.parse_args(argv)
