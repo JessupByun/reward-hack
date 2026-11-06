@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "tokens": 93,
+  "words": 48,
+  "blocks": 47,
+  "counter": "anthropic/claude-haiku-5-5",
+  "agent": "anthropic/claude-haiku-5-5",
+  "logs": [
+    "logs/pilot/haiku-conflict/2026-11-06T03-22-32-00-00_false-assurance_JzM3HbdHrfUHk5mEacU4FF.eval",
+    "logs/pilot/haiku-normal/2026-11-06T03-22-15-00-00_false-assurance_2EeNozSHUMGvvhjN4XSyQj.eval"
+  ]
+}
