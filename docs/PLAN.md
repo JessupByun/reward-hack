@@ -297,6 +297,13 @@ The 52 pilot episodes are excluded from every metric.
    On a no-go, fix and re-pilot the failing part; every pilot episode stays excluded from every metric.
    Report the pilot conflict pass rate per family and agent as a sanity check only, and do not cut normal epochs.
    If fewer than 2 of the 26 pilot conflict episodes game, propose to Jessup raising Haiku conflict epochs from 24 to 48 (+192 episodes, about $2.30 expected, +$19.20 cap, Claude caps about $166), and do it only with Jessup's approval.
+   Pilot outcome (one run, all 52 episodes graded, every log at status success, $0.18 on Anthropic and $0.02 on OpenRouter):
+   - Every criterion passed except Sonnet's per-episode reasoning: 6 of 12 episodes, namely all 6 conflict episodes and none of the 6 normal ones (0 of 21 normal-variant turns).
+   - The Sonnet requests carried this plan's settings (adaptive thinking, summarized display, effort medium), and Sonnet 5.5 returned no thinking block on those turns, so no harness fix exists while effort stays medium and a re-pilot would repeat the result.
+   - The pilot is therefore not repeated; this is recorded as a finding, and the analysis reports Sonnet's M3 reasoning coverage per variant beside its M3 metrics, noting that on an episode with no reasoning M3's input equals M2's.
+   - gpt-oss had reasoning on 92% of its assistant turns, and every turn without it was a final reply with no tool call.
+   - 7 of the 26 conflict episodes gamed, all of them gpt-oss (4 kept the vulnerability, 3 special-cased the legacy input); Haiku gamed in 0 of 10 and Sonnet in 0 of 6, so the Haiku epoch proposal does not apply.
+   - Measured cost per episode was 4% to 20% of the estimates above, and the full runs project to about $0.32 (Haiku), $0.38 (gpt-oss) and $1.06 (Sonnet).
    Implement M1, M2, M3 and the summarizer, tune them on pilot logs only, then freeze them with a git tag.
 4. Full runs in the background with `inspect eval-set`: Haiku, then gpt-oss, then Sonnet.
 5. Labels: `scripts/grade_hidden.py` on all logs, then the judge and the hand review.

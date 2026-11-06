@@ -11,11 +11,15 @@ logs/labels/labels.jsonl by default, so the labels for the default paths come fr
     uv run python scripts/grade_hidden.py logs/pilot/*-* --out logs/pilot/labels.jsonl
 --earlier-logs (where scripts/run_pilot.sh tells the operator to move a rejected attempt's logs before a
 re-pilot) and --smoke-logs (the live smoke test's logs) are searched recursively for .eval files too, and only
-each log header's spend over every call (stats.model_usage) is read; a directory that does not exist holds
+each log's header and sample summaries are read: each log counts, per provider, the larger of its header's
+spend over every call (stats.model_usage) and its samples' model_usage; a directory that does not exist holds
 none, and a log whose eval_id was already counted is counted once.
 Earlier attempts are pilot spend, so their Anthropic spend counts against the Claude pilot cap and their
 OpenRouter spend comes off the gpt-oss cap; the smoke test's OpenRouter spend comes off the gpt-oss cap too,
 which PLAN's Budget table shares between the gpt-oss agent, the pilot and the smoke test.
+Inspect keeps no record of some spend (see RETRY_SPEND): a log that never finished (status started), or that
+shows eval-set replaced a failed attempt's log with it, makes its provider's spend a lower bound, and then the
+cap criterion that spend feeds fails, since it cannot be shown within the cap.
 Every reasoning text and count comes from rewardhack.monitors.reasoning.
 This script only reads logs and labels: it calls no model, runs no agent code and launches no run.
 A proposal, such as more Haiku conflict epochs, is only written into the report for Jessup to approve.
@@ -26,8 +30,8 @@ Bad input is a missing or unreadable log or label file, logs that do not hold ex
 episodes, a gpt-oss log run without --log-model-api (so the provider of every model event cannot be
 checked), label rows that do not match the samples one to one, a sample without the episode_record
 fields the report reads, an --earlier-logs or --smoke-logs path that exists but is not a directory, or an
-earlier-attempt or smoke log that cannot be read or whose header has an Anthropic or OpenRouter model usage
-without a total_cost.
+earlier-attempt or smoke log that cannot be read or whose header or sample summaries have an Anthropic or
+OpenRouter model usage without a total_cost.
 """
 
 import argparse
@@ -36,10 +40,11 @@ import sys
 from collections import Counter
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 
-from inspect_ai.log import EvalLog, EvalSample, read_eval_log
-from inspect_ai.model import ChatMessageAssistant
+from inspect_ai.log import EvalLog, EvalSample, read_eval_log, read_eval_log_sample_summaries
+from inspect_ai.model import ChatMessageAssistant, ModelUsage
 from inspect_ai.tool import ToolError
 
 from rewardhack.label import OUTCOMES
@@ -117,8 +122,42 @@ BOOST_PROPOSAL = (
 APPROVAL = "This needs Jessup's approval, and this report does not change any epochs or start any run."
 # CLAUDE.md: "Any spend above the plan's caps ... needs Jessup's approval first."
 SPEND_APPROVAL = (
-    "A spend criterion failed, so the pilot's spend or a projected full run is over a hard cap, and any further "
-    "run, a re-pilot included, needs Jessup's approval first."
+    "A spend criterion failed, so the pilot's spend or a projected full run is over a hard cap or cannot be shown "
+    "within it, and any further run, a re-pilot included, needs Jessup's approval first."
+)
+
+# What Inspect 0.3.282 keeps of a retried task's spend (paths under inspect_ai/).
+# scripts/run_pilot.sh's eval-set retries a failed task in the same process (_eval/evalset.py:486-489 and 608, as
+# --retry-immediate is the default); the retry gets a fresh log and eval_id (_eval/run.py:995-1010,
+# _eval/task/log.py:407-442), and its header's model usage starts from the task's initial usage, not the failed
+# attempt's (_eval/task/run.py:768-775, _eval/context.py:64), as the header copies only that usage
+# (_eval/task/log.py:1254-1261).
+# Samples the retry reuses keep their own model_usage, which is not added to the header (_eval/task/run.py:1424-1479).
+# When eval-set ends it deletes each task's logs but the newest (_eval/evalset.py:969, 1216-1218 and 1958-2049), so
+# the failed attempt's calls are in no log; a re-invoked eval-set instead carries the replaced log's header usage
+# forward (_eval/loader.py:337-345), but nothing in the logs shows which happened.
+# The signs a log keeps: a reused sample started before the retry did (_eval/task/run.py:796), and a re-run sample's
+# error_retries are seeded from the failed attempt (_eval/task/run.py:1508-1510, 2605 and 3987-3998), past what
+# --retry-on-error allows; a sample cancelled when a sibling failed is not seeded, so a failed attempt in which no
+# sample finished or failed on its own leaves no sign.
+# Within one attempt, a sample's model_usage restarts at each retry-on-error attempt (_eval/task/run.py:2488) while
+# the header counts every call (model/_model.py:3110-3111), and EvalRetryError keeps events but no usage
+# (log/_log.py:430-443).
+# A log killed while running has no header.json, so its header has no stats (log/_recorders/eval.py:1863-1890);
+# Inspect's own recovery rebuilds them from the samples' model_usage (log/_recover/_write.py:378-416).
+RETRY_SPEND = (
+    "When eval-set retries a failed task in the same run, the retry's log starts its total over every call afresh, "
+    "and once eval-set ends it deletes the failed attempt's log, so that attempt's calls are in no log.",
+    "A re-invoked eval-set instead carries the replaced log's total forward, but the logs do not show which happened.",
+    "A log shows a replaced attempt when one of its samples started before the log did, as it was copied from the "
+    "failed attempt, or has more error retries than --retry-on-error allows, as it was re-run after that attempt.",
+    "A log that never finished (status started) keeps only the samples it wrote before it stopped.",
+    "Either kind of log among the pilot or earlier-attempt logs, or among the smoke test's gpt-oss logs, makes the "
+    "spend counted against its provider's cap a lower bound, and that cap's criterion fails, as the spend cannot "
+    "then be shown within the cap.",
+    "A failed attempt in which no sample finished or failed on its own leaves no sign, so its calls are missed "
+    "without notice.",
+    "Where a spend is a lower bound, the provider's own usage records have the full figure.",
 )
 
 # Label row fields this report reads from every graded (not errored) grade_hidden row, with their types.
@@ -185,18 +224,82 @@ def provider_of(model: str) -> str:
     return model.split("/", 1)[0]
 
 
+def paid_providers(models: Iterable[str]) -> list[str]:
+    return sorted({provider_of(model) for model in models} & set(PROVIDERS))
+
+
 def no_spend() -> dict:
     """Spend from no logs: build_report's default when no earlier-attempt or smoke logs are given."""
-    return {"dir": None, "logs": 0, "unfinished": [], "spend": dict.fromkeys(PROVIDERS, 0.0)}
+    return {
+        "dir": None, "logs": 0, "spend": dict.fromkeys(PROVIDERS, 0.0),
+        "incomplete": [], "incomplete_by_provider": {provider: [] for provider in PROVIDERS},
+    }
+
+
+def moment(value: str | None) -> datetime | None:
+    """A log's ISO time as an aware datetime (UTC when it names no zone), or None when it is unset."""
+    if not value:
+        return None
+    parsed = datetime.fromisoformat(value)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def replaced_signs(log: EvalLog, samples: Iterable[tuple[str | None, int]]) -> tuple[int, int]:
+    """The samples showing that eval-set replaced a failed attempt's log with this one (see RETRY_SPEND).
+
+    samples holds each sample's started_at and number of error retries.
+    Returns how many started before the log did (copied from the failed attempt) and how many have more error
+    retries than the log's --retry-on-error allows (re-run after it, with that attempt's errors seeded).
+    """
+    start = moment(log.stats.started_at)
+    allowed = log.eval.config.retry_on_error or 0
+    reused = rerun = 0
+    for started_at, retries in samples:
+        began = moment(started_at)
+        reused += start is not None and began is not None and began < start
+        rerun += retries > allowed
+    return reused, rerun
+
+
+def incomplete_log(
+    path: str, log: EvalLog, providers: list[str], samples: list[tuple[str | None, int]], spend: dict[str, float]
+) -> dict | None:
+    """A log whose counted spend is a lower bound, as it never finished or replaced a failed attempt, or None.
+
+    providers are the paid providers whose spend it counts, and spend is what it counts for each.
+    """
+    reused, rerun = replaced_signs(log, samples)
+    if not providers or (log.status != "started" and not reused and not rerun):
+        return None
+    return {
+        "path": path, "status": log.status, "providers": providers, "samples": len(samples),
+        "reused": reused, "rerun": rerun, "spend": spend,
+    }
+
+
+def paid_costs(usage: dict[str, ModelUsage], where: str, problems: list[str]) -> dict[str, float]:
+    """Each paid provider's total_cost in one model_usage; a paid usage without a total_cost is a problem."""
+    costs = dict.fromkeys(PROVIDERS, 0.0)
+    for model, entry in usage.items():
+        if provider_of(model) not in PROVIDERS:
+            continue
+        if entry.total_cost is None:
+            problems.append(f"{where} model_usage for {model} has no total_cost; was --model-cost-config costs.yaml set?")
+            continue
+        costs[provider_of(model)] += entry.total_cost
+    return costs
 
 
 def read_spend(logs_dir: Path, seen: set[str]) -> dict:
-    """Each paid provider's spend over every call in the .eval logs under logs_dir, from their headers only.
+    """Each paid provider's spend in the .eval logs under logs_dir, from their headers and sample summaries only.
 
     A directory that does not exist holds no logs.
     seen holds the eval_ids already counted (the pilot logs', to start with): a log with one of them is a copy of a
     log already counted and is skipped, and each log counted adds its own.
-    A log with status started never finished, so its header holds no final spend; it is listed as unfinished.
+    Each log counts, per provider, the larger of its header's spend over every call and its samples' model_usage:
+    the header leaves out samples reused from a replaced attempt, and a sample keeps only its final attempt's usage.
+    A log with status started never finished, so its header holds no final spend and only the samples it wrote
+    count; it and any log that replaced a failed attempt are listed as incomplete, as their spend is a lower bound.
     """
     found = no_spend() | {"dir": str(logs_dir)}
     if not logs_dir.exists():
@@ -213,16 +316,27 @@ def read_spend(logs_dir: Path, seen: set[str]) -> dict:
         if log.eval.eval_id in seen:
             continue
         seen.add(log.eval.eval_id)
+        try:
+            summaries = read_eval_log_sample_summaries(str(path))
+        except Exception as e:
+            problems.append(f"{path}: its sample summaries cannot be read ({type(e).__name__}: {e})")
+            continue
         found["logs"] += 1
-        if log.status == "started":
-            found["unfinished"].append(str(path))
-        for model, usage in log.stats.model_usage.items():
-            if provider_of(model) not in PROVIDERS:
-                continue
-            if usage.total_cost is None:
-                problems.append(f"{path}: the header's model_usage for {model} has no total_cost; was --model-cost-config costs.yaml set?")
-                continue
-            found["spend"][provider_of(model)] += usage.total_cost
+        header = paid_costs(log.stats.model_usage, f"{path}: the header's", problems)
+        samples = dict.fromkeys(PROVIDERS, 0.0)
+        for s in summaries:
+            for provider, cost in paid_costs(s.model_usage, f"{path} sample {s.id} epoch {s.epoch}: its", problems).items():
+                samples[provider] += cost
+        counted = {provider: max(header[provider], samples[provider]) for provider in PROVIDERS}
+        for provider, cost in counted.items():
+            found["spend"][provider] += cost
+        models = [log.eval.model, *log.stats.model_usage, *(model for s in summaries for model in s.model_usage)]
+        starts = [(s.started_at, s.retries or 0) for s in summaries]
+        record = incomplete_log(str(path), log, paid_providers(models), starts, counted)
+        if record:
+            found["incomplete"].append(record)
+            for provider in record["providers"]:
+                found["incomplete_by_provider"][provider].append(record["path"])
     if problems:
         raise BadInput(problems)
     return found
@@ -455,8 +569,16 @@ def episode_cost(sample: EvalSample) -> float:
 
 
 def all_calls_cost(log: EvalLog) -> float:
-    """The log's spend over every model call, including retried attempts that no sample's model_usage keeps."""
+    """The log's spend over every model call of its attempt, including the sample retries no model_usage keeps."""
     return sum(usage.total_cost or 0.0 for usage in log.stats.model_usage.values())
+
+
+def log_spend(log: EvalLog) -> float:
+    """A pilot log's spend: the larger of its samples' model_usage and its total over every call.
+
+    The total leaves out the samples a retried task reused from its failed attempt (see RETRY_SPEND).
+    """
+    return max(sum(episode_cost(sample) for sample in log.samples or []), all_calls_cost(log))
 
 
 def spend_section(episodes: list[Episode], logs: list[tuple[str, EvalLog]], earlier: dict, smoke: dict) -> dict:
@@ -466,11 +588,13 @@ def spend_section(episodes: list[Episode], logs: list[tuple[str, EvalLog]], earl
     A sample's model_usage covers only its final attempt (Inspect resets it at each attempt), while a log's
     stats.model_usage covers every call, so all_calls_per_episode divides the variant's logs' totals over every
     call by its episodes, errored ones included; each variant's projection uses the larger of the two.
-    The pilot's spend is the larger of its samples' model_usage and its logs' totals over every call.
+    The pilot's spend is the sum over its logs of log_spend.
     earlier and smoke are read_spend's spend of the earlier pilot attempts and of the smoke test.
     Earlier attempts are pilot spend: their Anthropic spend counts against the Claude pilot cap, and their
     OpenRouter spend comes off the gpt-oss cap with the smoke test's; the smoke test's Anthropic spend has its own
     Budget line (PLAN.md line 313), so it does not count toward the Claude pilot cap.
+    A pilot log that never finished or replaced a failed attempt is incomplete, and each provider's lower_bound_logs
+    lists the incomplete logs whose spend it counts against its cap (see RETRY_SPEND).
     """
     section: dict = {"agents": {}, "earlier_attempts": earlier, "smoke_test": smoke}
     for agent in AGENTS:
@@ -491,20 +615,31 @@ def spend_section(episodes: list[Episode], logs: list[tuple[str, EvalLog]], earl
                 "mean_over_estimate": None if projection is None else projection / ESTIMATED_EPISODE_COST[agent],
                 "full_run_episodes": FULL_RUN_EPOCHS[agent][variant] * FULL_RUN_TASKS,
             }
+        agent_logs = [(path, log) for path, log in logs if AGENT_OF_MODEL.get(log.eval.model) == agent]
         samples_total = sum(episode_cost(e.sample) for e in select(episodes, agent))
-        calls_total = sum(all_calls_cost(log) for _, log in logs if AGENT_OF_MODEL.get(log.eval.model) == agent)
-        pilot = max(samples_total, calls_total)
+        calls_total = sum(all_calls_cost(log) for _, log in agent_logs)
+        pilot = sum(log_spend(log) for _, log in agent_logs)
         means = [v["projection_mean"] for v in per_variant.values()]
         projected = (
             None if None in means else sum(v["projection_mean"] * v["full_run_episodes"] for v in per_variant.values())
         )
         provider = provider_of(AGENT_MODELS[agent])
+        incomplete = [
+            record
+            for path, log in agent_logs
+            if (record := incomplete_log(
+                path, log, [provider],
+                [(s.started_at, len(s.error_retries or [])) for s in log.samples or []],
+                dict.fromkeys(PROVIDERS, 0.0) | {provider: log_spend(log)},
+            ))
+        ]
         before = (pilot + earlier["spend"][provider] + smoke["spend"][provider]) if agent in CAP_SHARED_WITH_PILOT else 0.0
         section["agents"][agent] = {
             "per_variant": per_variant,
             "pilot_samples_total": samples_total,
             "pilot_all_calls_total": calls_total,
             "pilot_spend": pilot,
+            "incomplete": incomplete,
             "full_run_episodes": sum(v["full_run_episodes"] for v in per_variant.values()),
             "projected_full_run": projected,
             "plan_expected": PLAN_EXPECTED[agent],
@@ -513,7 +648,8 @@ def spend_section(episodes: list[Episode], logs: list[tuple[str, EvalLog]], earl
             "cap_spent_before_full_run": before,
             "cap_left_for_full_run": AGENT_CAP[agent] - before,
         }
-    claude = sum(section["agents"][agent]["pilot_spend"] for agent in CLAUDE_AGENTS)
+    agents = section["agents"]
+    claude = sum(agents[agent]["pilot_spend"] for agent in CLAUDE_AGENTS)
     section["pilot_by_provider"] = {
         "anthropic": {
             "spend": claude,
@@ -521,14 +657,23 @@ def spend_section(episodes: list[Episode], logs: list[tuple[str, EvalLog]], earl
             "against_cap": claude + earlier["spend"]["anthropic"],
             "expected": PILOT_CLAUDE_EXPECTED,
             "cap": PILOT_CLAUDE_CAP,
+            "lower_bound_logs": [
+                *(record["path"] for agent in CLAUDE_AGENTS for record in agents[agent]["incomplete"]),
+                *earlier["incomplete_by_provider"]["anthropic"],
+            ],
         },
         "openrouter": {
-            "spend": section["agents"]["gpt-oss"]["pilot_spend"],
+            "spend": agents["gpt-oss"]["pilot_spend"],
             "earlier_attempts": earlier["spend"]["openrouter"],
             "smoke_test": smoke["spend"]["openrouter"],
-            "against_cap": section["agents"]["gpt-oss"]["cap_spent_before_full_run"],
+            "against_cap": agents["gpt-oss"]["cap_spent_before_full_run"],
             "cap": AGENT_CAP["gpt-oss"],
             "note": "shared with the gpt-oss full run and the smoke test",
+            "lower_bound_logs": [
+                *(record["path"] for record in agents["gpt-oss"]["incomplete"]),
+                *earlier["incomplete_by_provider"]["openrouter"],
+                *smoke["incomplete_by_provider"]["openrouter"],
+            ],
         },
     }
     return section
@@ -700,6 +845,20 @@ def criterion(id_: str, title: str, plan: str, passed: bool, detail: str) -> dic
     return {"id": id_, "title": title, "plan": plan, "passed": bool(passed), "detail": detail}
 
 
+def plural(count: int, noun: str) -> str:
+    return f"{count} {noun}{'' if count == 1 else 's'}"
+
+
+def lower_bound_note(what: str, paths: list[str]) -> str:
+    """The end of a spend criterion's detail when its spend is a lower bound (RETRY_SPEND), else nothing."""
+    if not paths:
+        return ""
+    return (
+        f"; {what} is a lower bound, as Inspect kept only part of the spend of {plural(len(paths), 'log')} "
+        "listed under Spend, so the cap cannot be shown to hold"
+    )
+
+
 def criteria(report: dict) -> list[dict]:
     """Every go/no-go criterion, in PLAN.md's order, each citing the PLAN.md line it implements."""
     found = []
@@ -772,10 +931,12 @@ def criteria(report: dict) -> list[dict]:
     ))
     # PLAN.md line 293: "projected full-run spend per agent (per-variant pilot means times episodes) within that
     # agent's hard cap"; the caps are the Budget table's (lines 310-317).
+    # A spend taken off a cap that is only a lower bound (RETRY_SPEND) cannot show the cap holds, so it fails.
     openrouter = report["spend"]["pilot_by_provider"]["openrouter"]
     for agent in AGENTS:
         spend = report["spend"]["agents"][agent]
         projected, left = spend["projected_full_run"], spend["cap_left_for_full_run"]
+        short = openrouter["lower_bound_logs"] if spend["cap_shared_with_pilot"] else []
         shared = (
             f" (the {usd(spend['cap'])} cap less the pilot's {usd(spend['pilot_spend'], 4)}, the earlier pilot attempts' "
             f"{usd(openrouter['earlier_attempts'], 4)} and the smoke test's {usd(openrouter['smoke_test'], 4)})"
@@ -784,8 +945,9 @@ def criteria(report: dict) -> list[dict]:
         found.append(criterion(
             f"spend.{agent}", f"{agent} projected full-run spend",
             "projected full-run spend per agent (per-variant pilot means times episodes) within that agent's hard cap (line 293)",
-            projected is not None and projected <= left,
-            f"{usd(projected)} for {spend['full_run_episodes']} episodes against {usd(left)}{shared}",
+            projected is not None and projected <= left and not short,
+            f"{usd(projected)} for {spend['full_run_episodes']} episodes against {usd(left)}{shared}"
+            f"{lower_bound_note('the spend taken off the cap', short)}",
         ))
     # PLAN.md Budget table line 312: "Pilot, Claude part | 32 | $3.10 | $14.00"; earlier pilot attempts are pilot
     # spend too.
@@ -793,9 +955,10 @@ def criteria(report: dict) -> list[dict]:
     found.append(criterion(
         "spend.pilot-claude", "pilot spend, Claude part",
         "Pilot, Claude part: hard cap $14.00 (Budget table, line 312)",
-        claude["against_cap"] <= claude["cap"],
+        claude["against_cap"] <= claude["cap"] and not claude["lower_bound_logs"],
         f"{usd(claude['against_cap'], 4)} ({usd(claude['spend'], 4)} in these logs and {usd(claude['earlier_attempts'], 4)} "
-        f"in earlier pilot attempts) against the {usd(claude['cap'])} cap",
+        f"in earlier pilot attempts) against the {usd(claude['cap'])} cap"
+        f"{lower_bound_note('the spend counted', claude['lower_bound_logs'])}",
     ))
     # PLAN.md line 294: "treat more than 1 regeneration per episode on average for any agent as a no-go to investigate".
     for agent in AGENTS:
@@ -950,7 +1113,7 @@ def spend_lines(report: dict) -> list[str]:
         "A sample's model_usage covers only its final attempt, so each variant has two per-episode means.",
         "One is over its graded episodes' model_usage, and the other divides its logs' totals over every call by all its episodes, errored ones included.",
         "Each projection, and each ratio to PLAN's estimate, uses the larger of the two.",
-        "The pilot's spend is the larger of its samples' model_usage and its logs' totals over every call.",
+        "Each log's spend is the larger of its samples' model_usage and its total over every call.",
         "",
     ]
     agents = report["spend"]["agents"]
@@ -990,15 +1153,52 @@ def spend_lines(report: dict) -> list[str]:
         f"Smoke test ({read(smoke)}): {usd(smoke['spend']['openrouter'], 4)} on OpenRouter, which comes off the gpt-oss cap, "
         f"and {usd(smoke['spend']['anthropic'], 4)} on Anthropic, which has its own Budget line and is not counted toward "
         "the Claude pilot cap.",
-        *(
-            f"Log {path} has status started, so its header holds no final spend and its spend is not counted."
-            for path in earlier["unfinished"] + smoke["unfinished"]
-        ),
-        f"Counted against the {usd(anthropic['cap'])} Claude pilot cap: {usd(anthropic['against_cap'], 4)}.",
-        f"Taken off the {usd(openrouter['cap'])} gpt-oss cap shared with the full run: {usd(openrouter['against_cap'], 4)}, "
-        f"leaving {usd(left)} for the full run.",
+        f"Counted against the {usd(anthropic['cap'])} Claude pilot cap: {usd(anthropic['against_cap'], 4)}"
+        f"{', a lower bound' if anthropic['lower_bound_logs'] else ''}.",
+        f"Taken off the {usd(openrouter['cap'])} gpt-oss cap shared with the full run: {usd(openrouter['against_cap'], 4)}"
+        f"{', a lower bound' if openrouter['lower_bound_logs'] else ''}, leaving {usd(left)} for the full run.",
         "",
+        *incomplete_lines(report),
     ]
+
+
+def incomplete_line(record: dict) -> str:
+    """One log whose counted spend is a lower bound, saying what it counts and why (RETRY_SPEND)."""
+    path, samples = record["path"], plural(record["samples"], "sample")
+    if record["status"] == "started" and not any(record["spend"].values()):
+        line = (
+            f"Log {path} has status started, so it never finished, and it holds no Anthropic or OpenRouter spend in its "
+            f"header or its {samples}, so it counts $0.0000, a lower bound"
+        )
+    elif record["status"] == "started":
+        line = (
+            f"Log {path} has status started, so it never finished, and it counts {usd(record['spend']['anthropic'], 4)} "
+            f"on Anthropic and {usd(record['spend']['openrouter'], 4)} on OpenRouter, the larger of its header's model "
+            f"usage and the model_usage of its {samples}, a lower bound"
+        )
+    else:
+        line = f"Log {path} has status {record['status']}"
+    signs = [
+        f"{plural(count, 'sample')} {how} a failed earlier attempt"
+        for count, how in ((record["reused"], "copied from"), (record["rerun"], "re-run after"))
+        if count
+    ]
+    if signs:
+        line += f", and it holds {' and '.join(signs)}, so that attempt's spend may be in no log"
+    return line + "."
+
+
+def incomplete_lines(report: dict) -> list[str]:
+    spend = report["spend"]
+    records = [
+        *(record for agent in AGENTS for record in spend["agents"][agent]["incomplete"]),
+        *spend["earlier_attempts"]["incomplete"],
+        *spend["smoke_test"]["incomplete"],
+    ]
+    found = [incomplete_line(record) for record in records] or [
+        "Every pilot, earlier-attempt and smoke log finished, and none shows a replaced attempt."
+    ]
+    return ["### Spend that Inspect did not keep", "", *RETRY_SPEND, "", *found, ""]
 
 
 def regeneration_lines(report: dict) -> list[str]:
@@ -1090,12 +1290,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--earlier-logs", type=Path, default=DEFAULT_EARLIER_LOGS,
-        help="directory of earlier pilot attempts' logs, whose header spend counts as pilot spend "
+        help="directory of earlier pilot attempts' logs, whose spend (the larger of each log's header and its samples) counts as pilot spend "
         f"(default {DEFAULT_EARLIER_LOGS.relative_to(ROOT)}; none if it does not exist)",
     )
     parser.add_argument(
         "--smoke-logs", type=Path, default=DEFAULT_SMOKE_LOGS,
-        help="directory of the live smoke test's logs, whose header gpt-oss spend comes off the gpt-oss cap "
+        help="directory of the live smoke test's logs, whose gpt-oss spend (the larger of each log's header and its samples) comes off the gpt-oss cap "
         f"(default {DEFAULT_SMOKE_LOGS.relative_to(ROOT)}; none if it does not exist)",
     )
     args = parser.parse_args(argv)

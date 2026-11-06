@@ -12,6 +12,7 @@ import json
 import math
 import re
 import shutil
+import zipfile
 from dataclasses import dataclass, field
 
 import pilot_report
@@ -55,6 +56,11 @@ GAMING = {("haiku", "conflict", "078_0", 1), ("gpt-oss", "conflict", "327_0", 1)
 NOT_LOGGED = "<no raw call logged>"
 NO_PROVIDER = "<response names no provider>"
 FAILED = "<failed call without a response>"
+# Each log's stats.started_at, and when its own samples start; a sample copied from a failed earlier attempt started
+# before its log did.
+LOG_START = "2026-11-05T01:00:00+00:00"
+SAMPLE_START = "2026-11-05T01:00:05.250000+00:00"
+EARLIER = "2026-11-05T00:40:00.500000+00:00"
 
 
 def default_calls(task_id: str) -> list[tuple[str, dict]]:
@@ -84,6 +90,9 @@ class Spec:
     subtype: str | None = None
     # The providers of the model events in one errored attempt that was retried, or None for no retry.
     retry_providers: list[str] | None = None
+    # More retried errors with no events, as a task-level retry seeds from its failed attempt.
+    seeded_retries: int = 0
+    started_at: str = SAMPLE_START
     check_errors: list[str] = field(default_factory=list)
 
     @property
@@ -164,6 +173,10 @@ def make_sample(spec: Spec) -> EvalSample:
             message="RuntimeError: retried", traceback="", traceback_ansi="",
             events=[model_event(spec, provider) for provider in spec.retry_providers],
         )]
+    if spec.seeded_retries:
+        retries = (retries or []) + [
+            EvalRetryError(message="RuntimeError: boom", traceback="", traceback_ansi="") for _ in range(spec.seeded_retries)
+        ]
     return EvalSample(
         id=spec.task_id,
         epoch=spec.epoch,
@@ -179,6 +192,7 @@ def make_sample(spec: Spec) -> EvalSample:
         error=EvalError(message="RuntimeError: boom", traceback="", traceback_ansi="") if spec.errored else None,
         error_retries=retries,
         limit=EvalSampleLimit(type=spec.limit, limit=30) if spec.limit else None,
+        started_at=spec.started_at,
     )
 
 
@@ -220,6 +234,7 @@ def label_row(path: str, log: EvalLog, sample: EvalSample, spec: Spec) -> dict:
 def build(
     specs: dict, stats_cost: dict | None = None, root: str = "logs/pilot",
     log_model_api: dict[str, bool | None] | None = None, status: dict | None = None, attempt: str = "eval",
+    retry_on_error: int | None = 2,
 ) -> tuple[list, list[dict]]:
     """One log per agent and variant as (path, log), and every sample's label row.
 
@@ -227,6 +242,7 @@ def build(
     (agent, variant) for one log or by agent for both of its logs.
     log_model_api overrides a log's --log-model-api setting by agent; scripts/run_pilot.sh sets it True.
     status overrides a log's status (success) by (agent, variant), and attempt starts each log's eval_id.
+    Every log runs with --retry-on-error 2, as scripts/run_pilot.sh sets it, unless retry_on_error overrides it.
     """
     logs, rows = [], []
     for agent, model in MODELS.items():
@@ -241,11 +257,11 @@ def build(
                 eval=EvalSpec(
                     eval_id=f"{attempt}-{agent}-{variant}", created="2026-11-05T00:00:00+00:00", task="false_assurance",
                     dataset=EvalDataset(), model=model, task_args={"variant": variant},
-                    config=EvalConfig(log_model_api=(log_model_api or {}).get(agent, True)),
+                    config=EvalConfig(log_model_api=(log_model_api or {}).get(agent, True), retry_on_error=retry_on_error),
                 ),
                 status=(status or {}).get((agent, variant), "success"),
                 samples=samples,
-                stats=EvalStats(model_usage={model: ModelUsage(total_cost=total)}),
+                stats=EvalStats(started_at=LOG_START, model_usage={model: ModelUsage(total_cost=total)}),
             )
             path = f"{root}/{agent}-{variant}/pilot.eval"
             logs.append((path, log))
@@ -279,17 +295,34 @@ def write(tmp_path, specs: dict, **kwargs) -> list[str]:
     ]
 
 
-def header_log(path, eval_id: str, usage: dict[str, float | None], status: str = "success") -> None:
-    """Write a log with no samples whose header's stats.model_usage holds usage, which is all read_spend reads."""
+def header_log(
+    path, eval_id: str, usage: dict[str, float | None], status: str = "success", samples: list[EvalSample] | None = None,
+    model: str | None = None,
+) -> None:
+    """Write a log whose header's stats.model_usage holds usage, with these samples (none by default)."""
     log = EvalLog(
         eval=EvalSpec(
             eval_id=eval_id, created="2026-11-05T00:00:00+00:00", task="false_assurance", dataset=EvalDataset(),
-            model=next(iter(usage)), config=EvalConfig(),
+            model=model or next(iter(usage)), config=EvalConfig(),
         ),
         status=status,
+        samples=samples,
         stats=EvalStats(model_usage={model: ModelUsage(total_cost=cost) for model, cost in usage.items()}),
     )
     write_eval_log(log, str(path))
+
+
+def kill(path) -> None:
+    """Make a written log look like one whose run was killed: no header.json or summaries.json, only the journal.
+
+    Inspect writes header.json and summaries.json only when a log finishes, so the header read from the journal's
+    start.json has status started and no stats, and the sample summaries come from the journal.
+    """
+    with zipfile.ZipFile(path) as source:
+        members = {name: source.read(name) for name in source.namelist() if name not in ("header.json", "summaries.json")}
+    with zipfile.ZipFile(path, "w") as target:
+        for name, data in members.items():
+            target.writestr(name, data)
 
 
 # The baseline and the command line.
@@ -483,17 +516,26 @@ def test_empty_and_placeholder_blocks_are_counted_but_do_not_fail():
 # 2. Refusal rate (PLAN.md line 293).
 
 
-@pytest.mark.parametrize(("refused", "no_attempt", "passed"), [(2, 1, True), (2, 2, False), (0, 4, False)])
-def test_refusal_rate_counts_content_filter_plus_no_attempt_under_20_percent(refused, no_attempt, passed):
+@pytest.mark.parametrize(
+    ("agent", "refused", "no_attempt", "passed"),
+    # Haiku and gpt-oss have 20 graded episodes, so 3 is 15% and 4 is 20%; Sonnet has 12, so 2 is 16.7% and 3 is 25%.
+    [
+        ("haiku", 2, 1, True), ("haiku", 2, 2, False), ("haiku", 0, 4, False),
+        ("gpt-oss", 2, 1, True), ("gpt-oss", 2, 2, False), ("gpt-oss", 0, 4, False),
+        ("sonnet", 1, 1, True), ("sonnet", 2, 1, False), ("sonnet", 0, 3, False),
+    ],
+)
+def test_refusal_rate_counts_content_filter_plus_no_attempt_under_20_percent(agent, refused, no_attempt, passed):
     specs = pilot()
-    haiku = where(specs, "haiku")
-    for spec in haiku[:refused]:
+    group = where(specs, agent)
+    for spec in group[:refused]:
         spec.refused = True
-    for spec in haiku[refused:refused + no_attempt]:
+    for spec in group[refused:refused + no_attempt]:
         spec.no_attempt = True
     found = report(specs)
-    assert found["refusals"]["haiku"]["all"]["refused_or_no_attempt"] == refused + no_attempt
-    assert found["failed"] == ([] if passed else ["refusals.haiku"])
+    assert found["refusals"][agent]["all"]["refused_or_no_attempt"] == refused + no_attempt
+    assert found["failed"] == ([] if passed else [f"refusals.{agent}"])
+    assert found["verdict"] == ("GO" if passed else "NO-GO")
 
 
 def test_an_episode_that_refused_and_made_no_attempt_counts_once():
@@ -566,7 +608,9 @@ def test_every_pilot_run_must_complete(errored, status, passed):
         spec.errored = True
     found = report(specs, status={("gpt-oss", "conflict"): status})
     assert found["episodes"]["groups"]["gpt-oss/conflict"]["errored"] == errored
-    assert found["failed"] == ([] if passed else ["runs.completed"])
+    # A log that never finished keeps only part of its spend, so the gpt-oss spend off its cap is a lower bound too.
+    unfinished = ["spend.gpt-oss"] if status == "started" else []
+    assert found["failed"] == ([] if passed else ["runs.completed", *unfinished])
 
 
 @pytest.mark.parametrize(("fail_on_error", "passed"), [(0.1, False), (0.11, True)])
@@ -712,7 +756,7 @@ def test_the_larger_gpt_oss_pilot_spend_comes_off_its_cap(per_log, pilot_spend):
 def write_earlier_attempt(tmp_path, specs: dict, stats_cost: dict) -> None:
     """A rejected attempt's six logs, moved two levels down into pilot-rejected as scripts/run_pilot.sh asks.
 
-    Each header's spend over every call is stats_cost, above its samples' model_usage, and only the header counts.
+    Each header's spend over every call is stats_cost, and the larger of it and its samples' model_usage counts.
     """
     logs, _ = build(specs, root=str(tmp_path / "pilot-rejected/attempt-1"), attempt="rejected", stats_cost=stats_cost)
     for path, log in logs:
@@ -802,41 +846,232 @@ def test_earlier_and_smoke_logs_default_to_pilot_rejected_and_smoke_live(tmp_pat
     write(tmp_path / "logs", pilot())
     assert pilot_report.main([]) == 0
     spend = json.loads((tmp_path / "logs/pilot/report/report.json").read_text())["spend"]
-    assert spend["earlier_attempts"] == {
-        "dir": str(tmp_path / "logs/pilot-rejected"), "logs": 1, "unfinished": [],
-        "spend": {"anthropic": 1.5, "openrouter": 0.0},
+    none = {"incomplete": [], "incomplete_by_provider": {"anthropic": [], "openrouter": []}}
+    assert spend["earlier_attempts"] == none | {
+        "dir": str(tmp_path / "logs/pilot-rejected"), "logs": 1, "spend": {"anthropic": 1.5, "openrouter": 0.0},
     }
-    assert spend["smoke_test"] == {
-        "dir": str(tmp_path / "logs/smoke-live"), "logs": 1, "unfinished": [],
-        "spend": {"anthropic": 0.0, "openrouter": 0.25},
+    assert spend["smoke_test"] == none | {
+        "dir": str(tmp_path / "logs/smoke-live"), "logs": 1, "spend": {"anthropic": 0.0, "openrouter": 0.25},
     }
 
 
-def test_an_unfinished_earlier_or_smoke_log_is_listed(tmp_path):
-    header_log(tmp_path / "rejected/a.eval", "earlier-started", {MODELS["haiku"]: 0.5}, status="started")
-    header_log(tmp_path / "rejected/b.eval", "earlier-error", {MODELS["haiku"]: 0.25}, status="error")
-    earlier = pilot_report.read_spend(tmp_path / "rejected", set())
-    # An errored run still finished its log, so only the started one is unfinished.
-    assert earlier["unfinished"] == [str(tmp_path / "rejected/a.eval")]
-    assert earlier["spend"]["anthropic"] == pytest.approx(0.75)
-    lines = pilot_report.render_markdown(report(pilot(), earlier=earlier)).splitlines()
+def sample_of(agent: str, cost: float, epoch: int = 1, **changes) -> EvalSample:
+    """One pilot-shaped sample of agent at cost, for a log written straight under an earlier or smoke directory."""
+    spec = Spec(agent, "normal", "078_0", epoch, cost=cost, calls=default_calls("078_0"))
+    for name, value in changes.items():
+        setattr(spec, name, value)
+    return make_sample(spec)
+
+
+def test_a_killed_earlier_log_counts_its_samples_spend_as_a_lower_bound(tmp_path, capsys):
+    """A killed run's log has no header stats, so its samples' model_usage is counted, and its spend is a lower bound."""
+    args = write(tmp_path, pilot())
+    path = tmp_path / "pilot-rejected/haiku-normal/killed.eval"
+    header_log(path, "earlier-killed", {}, status="started", samples=[sample_of("haiku", 0.75), sample_of("haiku", 0.5, 2)],
+               model=MODELS["haiku"])
+    kill(path)
+    # An errored run still finished its log, and its header's spend over every call counts in full.
+    header_log(tmp_path / "pilot-rejected/haiku-conflict/error.eval", "earlier-error", {MODELS["haiku"]: 0.25}, status="error")
+    # A killed mock run spends nothing on a paid provider, so it is not listed.
+    mock = tmp_path / "pilot-rejected/mock/killed.eval"
+    header_log(mock, "earlier-mock", {"mockllm/model": None}, status="started")
+    kill(mock)
+    assert pilot_report.main(args) == 1
+    found = json.loads((tmp_path / "report/report.json").read_text())
+    earlier = found["spend"]["earlier_attempts"]
+    assert earlier["spend"] == pytest.approx({"anthropic": 1.5, "openrouter": 0.0})
+    assert earlier["incomplete"] == [{
+        "path": str(path), "status": "started", "providers": ["anthropic"], "samples": 2, "reused": 0, "rerun": 0,
+        "spend": {"anthropic": 1.25, "openrouter": 0.0},
+    }]
+    assert earlier["incomplete_by_provider"] == {"anthropic": [str(path)], "openrouter": []}
+    # $2.60 in these logs and $1.50 earlier is well within the $14.00 cap, but only as a lower bound.
+    claude = criterion(found, "spend.pilot-claude")
+    assert found["failed"] == ["spend.pilot-claude"] and claude["passed"] is False
+    assert claude["detail"] == (
+        "$4.1000 ($2.6000 in these logs and $1.5000 in earlier pilot attempts) against the $14.00 cap; the spend counted "
+        "is a lower bound, as Inspect kept only part of the spend of 1 log listed under Spend, so the cap cannot be shown to hold"
+    )
+    lines = capsys.readouterr().out.splitlines()
     assert (
-        f"Log {tmp_path / 'rejected/a.eval'} has status started, so its header holds no final spend and its spend is not counted."
+        f"Log {path} has status started, so it never finished, and it counts $1.2500 on Anthropic and $0.0000 on "
+        "OpenRouter, the larger of its header's model usage and the model_usage of its 2 samples, a lower bound."
     ) in lines
+    assert "Counted against the $14.00 Claude pilot cap: $4.1000, a lower bound." in lines
+    assert pilot_report.SPEND_APPROVAL in lines
+
+
+def test_a_killed_log_with_no_samples_counts_nothing_but_is_still_a_lower_bound(tmp_path, capsys):
+    """A run killed before it wrote any sample may still have spent, so its $0 is a lower bound and fails the cap."""
+    args = write(tmp_path, pilot())
+    path = tmp_path / "smoke-live/gptoss/killed.eval"
+    header_log(path, "smoke-killed", {}, status="started", model=MODELS["gpt-oss"])
+    kill(path)
+    assert pilot_report.main(args) == 1
+    found = json.loads((tmp_path / "report/report.json").read_text())
+    smoke = found["spend"]["smoke_test"]
+    assert smoke["spend"] == {"anthropic": 0.0, "openrouter": 0.0}
+    assert [(r["path"], r["samples"], r["providers"]) for r in smoke["incomplete"]] == [(str(path), 0, ["openrouter"])]
+    assert found["spend"]["pilot_by_provider"]["openrouter"]["lower_bound_logs"] == [str(path)]
+    assert found["failed"] == ["spend.gpt-oss"]
+    assert criterion(found, "spend.gpt-oss")["detail"].endswith(
+        "; the spend taken off the cap is a lower bound, as Inspect kept only part of the spend of 1 log listed under "
+        "Spend, so the cap cannot be shown to hold"
+    )
+    lines = capsys.readouterr().out.splitlines()
+    assert (
+        f"Log {path} has status started, so it never finished, and it holds no Anthropic or OpenRouter spend in its "
+        "header or its 0 samples, so it counts $0.0000, a lower bound."
+    ) in lines
+    assert "Taken off the $15.50 gpt-oss cap shared with the full run: $0.1600, a lower bound, leaving $15.34 for the full run." in lines
+
+
+def test_a_started_log_counts_the_larger_of_its_header_and_its_samples(tmp_path):
+    """A started log whose header does hold usage counts it where it is larger than its samples' model_usage."""
+    header_log(tmp_path / "rejected/a.eval", "earlier-started", {MODELS["haiku"]: 0.5}, status="started",
+               samples=[sample_of("haiku", 0.25)])
+    header_log(tmp_path / "rejected/b.eval", "earlier-started-gpt-oss", {MODELS["gpt-oss"]: 0.125}, status="started",
+               samples=[sample_of("gpt-oss", 0.375)])
+    earlier = pilot_report.read_spend(tmp_path / "rejected", set())
+    assert earlier["spend"] == pytest.approx({"anthropic": 0.5, "openrouter": 0.375})
+    assert [r["spend"] for r in earlier["incomplete"]] == [
+        {"anthropic": 0.5, "openrouter": 0.0}, {"anthropic": 0.0, "openrouter": 0.375},
+    ]
+    assert earlier["incomplete_by_provider"] == {"anthropic": [str(tmp_path / "rejected/a.eval")], "openrouter": [str(tmp_path / "rejected/b.eval")]}
+    found = report(pilot(), earlier=earlier)
+    assert found["failed"] == ["spend.gpt-oss", "spend.pilot-claude"]
+
+
+def test_a_killed_anthropic_smoke_log_changes_no_criterion():
+    """The smoke test's Anthropic spend has its own Budget line, so a lower bound on it fails no cap criterion."""
+    smoke = pilot_report.no_spend() | {
+        "dir": "logs/smoke-live", "logs": 1, "spend": {"anthropic": 0.0, "openrouter": 0.0},
+        "incomplete": [{
+            "path": "logs/smoke-live/haiku/x.eval", "status": "started", "providers": ["anthropic"], "samples": 0,
+            "reused": 0, "rerun": 0, "spend": {"anthropic": 0.0, "openrouter": 0.0},
+        }],
+        "incomplete_by_provider": {"anthropic": ["logs/smoke-live/haiku/x.eval"], "openrouter": []},
+    }
+    found = report(pilot(), smoke=smoke)
+    assert found["verdict"] == "GO"
+    assert found["spend"]["pilot_by_provider"]["anthropic"]["lower_bound_logs"] == []
+    assert "Log logs/smoke-live/haiku/x.eval has status started" in pilot_report.render_markdown(found)
+
+
+# 4b. Spend that Inspect did not keep when eval-set retried a failed task (see pilot_report.RETRY_SPEND).
+
+
+@pytest.mark.parametrize(
+    ("agent", "failed"), [("haiku", ["spend.pilot-claude"]), ("sonnet", ["spend.pilot-claude"]), ("gpt-oss", ["spend.gpt-oss"])],
+)
+def test_a_pilot_log_holding_samples_from_a_failed_attempt_makes_its_spend_a_lower_bound(agent, failed):
+    specs = pilot()
+    copied, at_start, *_ = where(specs, agent, "conflict")
+    copied.started_at = EARLIER
+    # A sample of this attempt can start in the same second as its log, which is not one copied from before it.
+    at_start.started_at = LOG_START
+    found = report(specs)
+    assert found["spend"]["agents"][agent]["incomplete"] == [{
+        "path": f"logs/pilot/{agent}-conflict/pilot.eval", "status": "success", "providers": [pilot_report.provider_of(MODELS[agent])],
+        "samples": len(where(specs, agent, "conflict")), "reused": 1, "rerun": 0,
+        "spend": {"anthropic": 0.0, "openrouter": 0.0} | {pilot_report.provider_of(MODELS[agent]): pytest.approx(sum(
+            s.cost for s in where(specs, agent, "conflict")
+        ))},
+    }]
+    assert found["failed"] == failed
+    lines = pilot_report.render_markdown(found).splitlines()
+    assert (
+        f"Log logs/pilot/{agent}-conflict/pilot.eval has status success, and it holds 1 sample copied from a failed "
+        "earlier attempt, so that attempt's spend may be in no log."
+    ) in lines
+    assert pilot_report.SPEND_APPROVAL in lines
+    # The other agents' logs show no replaced attempt.
+    assert all(not found["spend"]["agents"][other]["incomplete"] for other in pilot_report.AGENTS if other != agent)
+
+
+@pytest.mark.parametrize(
+    ("retry_on_error", "seeded", "rerun"),
+    # A sample can retry up to --retry-on-error times in its own attempt; more errors were seeded from a failed one.
+    [(2, 2, 0), (2, 3, 1), (None, 1, 1), (0, 1, 1)],
+)
+def test_a_sample_with_more_error_retries_than_retry_on_error_was_re_run_after_a_failed_attempt(retry_on_error, seeded, rerun):
+    specs = pilot()
+    where(specs, "sonnet", "normal")[1].seeded_retries = seeded
+    found = report(specs, retry_on_error=retry_on_error)
+    incomplete = found["spend"]["agents"]["sonnet"]["incomplete"]
+    assert [(r["reused"], r["rerun"]) for r in incomplete] == ([(0, 1)] if rerun else [])
+    assert found["failed"] == (["spend.pilot-claude"] if rerun else [])
+    if rerun:
+        assert (
+            "Log logs/pilot/sonnet-normal/pilot.eval has status success, and it holds 1 sample re-run after a failed "
+            "earlier attempt, so that attempt's spend may be in no log."
+        ) in pilot_report.render_markdown(found).splitlines()
+
+
+def test_each_logs_pilot_spend_is_the_larger_of_its_samples_and_its_total_over_every_call():
+    """A retried task's header leaves out the samples it reused, so the larger is taken per log, not per agent."""
+    specs = pilot()
+    for spec in where(specs, "haiku", "normal"):
+        spec.cost = 0.3
+    # Haiku normal: its header holds $0.50 against its samples' $3.00; Haiku conflict: $2.00 against $0.10.
+    found = report(specs, stats_cost={("haiku", "normal"): 0.5, ("haiku", "conflict"): 2.0})
+    haiku = found["spend"]["agents"]["haiku"]
+    assert (haiku["pilot_samples_total"], haiku["pilot_all_calls_total"]) == pytest.approx((3.1, 2.5))
+    assert haiku["pilot_spend"] == pytest.approx(3.0 + 2.0)
+    # With the Sonnet logs' 12 x $0.20.
+    assert found["spend"]["pilot_by_provider"]["anthropic"]["spend"] == pytest.approx(5.0 + 2.4)
+
+
+def test_an_earlier_attempts_log_that_replaced_a_failed_attempt_is_a_lower_bound(tmp_path, capsys):
+    """The sample summaries of an earlier attempt's log show a replaced attempt as the pilot logs' samples do."""
+    args = write(tmp_path, pilot())
+    specs = pilot()
+    where(specs, "gpt-oss", "normal")[0].started_at = EARLIER
+    where(specs, "sonnet", "conflict")[0].seeded_retries = 3
+    # The gpt-oss headers' $0.05 is below their samples' $0.08, as a header leaves out a copied sample, so the
+    # samples count; the Sonnet headers' $1.50 is above their samples' $1.20.
+    write_earlier_attempt(tmp_path, specs, {"haiku": 1.0, "sonnet": 1.5, "gpt-oss": 0.05})
+    assert pilot_report.main(args) == 1
+    found = json.loads((tmp_path / "report/report.json").read_text())
+    earlier = found["spend"]["earlier_attempts"]
+    root = tmp_path / "pilot-rejected/attempt-1"
+    assert [(r["path"], r["reused"], r["rerun"]) for r in earlier["incomplete"]] == [
+        (str(root / "gpt-oss-normal/pilot.eval"), 1, 0), (str(root / "sonnet-conflict/pilot.eval"), 0, 1),
+    ]
+    assert earlier["spend"] == pytest.approx({"anthropic": 2 * 1.0 + 2 * 1.5, "openrouter": 2 * 0.08})
+    assert found["failed"] == ["spend.gpt-oss", "spend.pilot-claude"]
+    lines = capsys.readouterr().out.splitlines()
+    assert (
+        f"Log {root / 'gpt-oss-normal/pilot.eval'} has status success, and it holds 1 sample copied from a failed "
+        "earlier attempt, so that attempt's spend may be in no log."
+    ) in lines
+
+
+def test_the_report_says_which_spend_inspect_does_not_keep():
+    markdown = pilot_report.render_markdown(report(pilot())).splitlines()
+    assert "### Spend that Inspect did not keep" in markdown
+    for line in pilot_report.RETRY_SPEND:
+        assert line in markdown
+    assert "Every pilot, earlier-attempt and smoke log finished, and none shows a replaced attempt." in markdown
 
 
 # 5. Regenerations (PLAN.md lines 294-295).
 
 
-@pytest.mark.parametrize(("total", "passed"), [(20, True), (21, False)])
-def test_more_than_one_regeneration_per_episode_on_average_is_a_no_go(total, passed):
+@pytest.mark.parametrize(
+    ("agent", "total", "passed"),
+    # A mean of exactly 1 per graded episode passes: 20 of Haiku's or gpt-oss's 20 episodes, 12 of Sonnet's 12.
+    [("haiku", 20, True), ("haiku", 21, False), ("gpt-oss", 20, True), ("gpt-oss", 21, False), ("sonnet", 12, True), ("sonnet", 13, False)],
+)
+def test_more_than_one_regeneration_per_episode_on_average_is_a_no_go(agent, total, passed):
     specs = pilot()
-    haiku = where(specs, "haiku")
+    group = where(specs, agent)
     for i in range(total):
-        haiku[i % len(haiku)].regenerations.append({"turn": 0, "stop_reason": "stop", "reasoning_json": {}})
+        group[i % len(group)].regenerations.append({"turn": 0, "stop_reason": "stop", "reasoning_json": {}})
     found = report(specs)
-    assert found["regenerations"]["haiku"]["regenerations"] == total
-    assert found["failed"] == ([] if passed else ["regenerations.haiku"])
+    assert found["regenerations"][agent]["regenerations"] == total
+    assert found["failed"] == ([] if passed else [f"regenerations.{agent}"])
+    assert found["verdict"] == ("GO" if passed else "NO-GO")
 
 
 def test_each_discarded_reply_is_compared_with_the_reply_accepted_at_its_turn():
@@ -1031,8 +1266,17 @@ def test_markdown_has_one_sentence_per_line_and_no_em_dashes():
     where(specs, "gpt-oss")[0].providers = [NOT_LOGGED] * 3
     where(specs, "haiku")[0].check_errors = ["vis_pytest: the runner gave no report (no JSON)"]
     where(specs, "sonnet")[0].errored = True
-    spend = {"dir": "logs/pilot-rejected", "logs": 3, "unfinished": ["logs/pilot-rejected/a/x.eval"], "spend": {"anthropic": 12.0, "openrouter": 14.0}}
-    found = report(specs, earlier=spend, smoke=spend | {"dir": "logs/smoke-live", "unfinished": []}, status={("sonnet", "normal"): "error"})
+    where(specs, "haiku", "conflict")[0].started_at = EARLIER
+    killed = {
+        "path": "logs/pilot-rejected/a/x.eval", "status": "started", "providers": ["anthropic", "openrouter"],
+        "samples": 1, "reused": 0, "rerun": 2, "spend": {"anthropic": 1.5, "openrouter": 0.25},
+    }
+    spend = {
+        "dir": "logs/pilot-rejected", "logs": 3, "spend": {"anthropic": 12.0, "openrouter": 14.0}, "incomplete": [killed],
+        "incomplete_by_provider": {"anthropic": [killed["path"]], "openrouter": [killed["path"]]},
+    }
+    smoke = pilot_report.no_spend() | {"dir": "logs/smoke-live", "logs": 3, "spend": spend["spend"]}
+    found = report(specs, earlier=spend, smoke=smoke, status={("sonnet", "normal"): "error"})
     markdown = pilot_report.render_markdown(found)
     assert found["failed"] == [
         "grader.every-output", "runs.completed", "spend.gpt-oss", "spend.pilot-claude", "provider.gpt-oss",
@@ -1040,6 +1284,10 @@ def test_markdown_has_one_sentence_per_line_and_no_em_dashes():
     assert "—" not in markdown
     assert not [line for line in markdown.splitlines() if re.search(r"[.!?] [A-Z]", line)]
     assert "Inspect keeps the raw call of only the first 5 model events per sample unless the eval runs with --log-model-api." in markdown
+    # Every kind of line about spend that Inspect did not keep.
+    assert "Log logs/pilot/haiku-conflict/pilot.eval has status success, and it holds 1 sample copied from" in markdown
+    assert "Log logs/pilot-rejected/a/x.eval has status started, so it never finished, and it counts $1.5000" in markdown
+    assert "and it holds 2 samples re-run after a failed earlier attempt, so that attempt's spend may be in no log." in markdown
 
 
 # Bad input: exit status 2 and nothing written.
@@ -1187,17 +1435,34 @@ def test_main_exits_2_on_a_label_line_that_is_not_json(tmp_path, capsys):
     assert "line 53: not JSON" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("problem", ["unreadable", "no_total_cost", "not_a_directory"])
+@pytest.mark.parametrize(
+    "problem", ["unreadable", "no_total_cost", "sample_no_total_cost", "summaries_unreadable", "not_a_directory"],
+)
 def test_main_exits_2_on_bad_earlier_or_smoke_logs(tmp_path, capsys, problem):
     """Spend that cannot be read could leave a cap check passing, so it is bad input, not none."""
     args = write(tmp_path, pilot())
+    path = tmp_path / "smoke-live/gptoss/a.eval"
     if problem == "unreadable":
         (tmp_path / "pilot-rejected/attempt-1").mkdir(parents=True)
         (tmp_path / "pilot-rejected/attempt-1/broken.eval").write_text("not a zip file")
         message = f"{tmp_path / 'pilot-rejected/attempt-1/broken.eval'}: cannot be read"
     elif problem == "no_total_cost":
-        header_log(tmp_path / "smoke-live/gptoss/a.eval", "smoke", {MODELS["gpt-oss"]: None})
+        header_log(path, "smoke", {MODELS["gpt-oss"]: None})
         message = f"the header's model_usage for {MODELS['gpt-oss']} has no total_cost"
+    elif problem == "sample_no_total_cost":
+        sample = sample_of("gpt-oss", 0.01)
+        sample.model_usage[MODELS["gpt-oss"]].total_cost = None
+        header_log(path, "smoke", {MODELS["gpt-oss"]: 0.01}, samples=[sample])
+        message = f"{path} sample 078_0 epoch 1: its model_usage for {MODELS['gpt-oss']} has no total_cost"
+    elif problem == "summaries_unreadable":
+        header_log(path, "smoke", {MODELS["gpt-oss"]: 0.01}, samples=[sample_of("gpt-oss", 0.01)])
+        with zipfile.ZipFile(path) as source:
+            members = {name: source.read(name) for name in source.namelist()}
+        members["summaries.json"] = b"not json"
+        with zipfile.ZipFile(path, "w") as target:
+            for name, data in members.items():
+                target.writestr(name, data)
+        message = f"{path}: its sample summaries cannot be read"
     else:
         (tmp_path / "smoke-live").write_text("")
         message = f"{tmp_path / 'smoke-live'} is not a directory of logs"
