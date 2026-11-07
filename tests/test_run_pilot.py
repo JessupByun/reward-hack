@@ -35,6 +35,8 @@ from inspect_ai.log import EvalConfig, EvalDataset, EvalLog, EvalSpec, read_eval
 from rewardhack.task import ROOT
 
 SCRIPT = ROOT / "scripts/run_pilot.sh"
+# The launch logic run_pilot.sh sources, shared with scripts/run_main.sh.
+LIB = ROOT / "scripts/launch_lib.sh"
 COSTS_SHA256 = hashlib.sha256((ROOT / "costs.yaml").read_bytes()).hexdigest()
 PREFIX = ["uv", "run", "--no-env-file", "inspect", "eval-set", "src/rewardhack/task.py"]
 PREFLIGHT = ["run", "--no-env-file", "python", "-"]
@@ -143,14 +145,20 @@ exit 1
 """
 
 
+# The uv variables the launchers allow (UV_ENV_FILE and UV_NO_ENV_FILE too, which clean_env still removes, so that
+# a test sets them only on purpose); every other UV_* variable is refused.
+UV_ALLOWED = ("UV_RUN_RECURSION_DEPTH", "UV_CACHE_DIR", "UV_NO_PROGRESS")
+
+
 def clean_env(**extra: str) -> dict[str, str]:
     """The test's environment without the variables the script or dotenv reads, with NO_SPEND, plus extra."""
     env = {
         key: value
         for key, value in os.environ.items()
-        if not key.upper().startswith(("INSPECT_EVAL_", "PILOT_", "AGENT", "FAKE_", "VSCODE_"))
-        and "DRY" not in key.upper()
-        and key not in ("TERM_PROGRAM", "UV_ENV_FILE", "UV_NO_ENV_FILE")
+        if not key.upper().startswith(("INSPECT_", "PILOT_", "MAIN_", "AGENT", "FAKE_", "VSCODE_"))
+        and not any(part in key.upper() for part in ("DRY", "MODEL_OVERRIDE", "EPOCHS_OVERRIDE", "LOG_ROOT"))
+        and not (key.startswith("UV_") and key not in UV_ALLOWED)
+        and key not in ("TERM_PROGRAM", "PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP")
     }
     return {**env, **NO_SPEND, **extra}
 
@@ -259,10 +267,12 @@ def harness_sha256(root: Path) -> str:
 
 
 def make_fake_root(base: Path) -> dict:
-    """A copy of the script and costs.yaml in base/repo, with FAKE_HARNESS, no .env file and a fake uv first on PATH."""
+    """A copy of the script, the launch library and costs.yaml in base/repo, with FAKE_HARNESS, no .env file and a
+    fake uv first on PATH."""
     root = (base / "repo").resolve()
     (root / "scripts").mkdir(parents=True)
     shutil.copy2(SCRIPT, root / "scripts/run_pilot.sh")
+    shutil.copy2(LIB, root / "scripts/launch_lib.sh")
     shutil.copy2(ROOT / "costs.yaml", root / "costs.yaml")
     for name, text in FAKE_HARNESS.items():
         (root / name).parent.mkdir(parents=True, exist_ok=True)
@@ -403,6 +413,7 @@ ROOT_ABSOLUTE = "PILOT_LOG_ROOT must be an absolute directory"
 ROOT_DOTS = "PILOT_LOG_ROOT must not contain . or .. components"
 ROOT_OUTSIDE = "PILOT_LOG_ROOT must be outside this repository"
 UNREAD = "reads only DRY_RUN, AGENTS, PILOT_MODEL_OVERRIDE, PILOT_EPOCHS_OVERRIDE and PILOT_LOG_ROOT; unset them first: "
+UV_VARS = "unset these uv variables first, which would change the project, environment or settings every uv command uses: "
 # {root} is the fake root, {upper} the same path in upper case, and {link} a symlink to it.
 REFUSALS = [
     ({"DRY_RUN": "yes"}, "DRY_RUN must be 1, 0 or unset"),
@@ -412,6 +423,17 @@ REFUSALS = [
     ({"AGENTS": "haiku,sonnet"}, "unknown agent 'haiku,sonnet'"),
     ({"INSPECT_EVAL_FALLBACK_MODELS": "anthropic/claude-sonnet-5-5"}, "INSPECT_EVAL_FALLBACK_MODELS"),
     ({"INSPECT_EVAL_REASONING_TOKENS": "1000"}, "INSPECT_EVAL_REASONING_TOKENS"),
+    ({"PYTHONPATH": "/tmp/site"}, "unset these Python variables first, which would change the code the runs load: PYTHONPATH"),
+    # uv's own variables could make every uv command use another tree or environment under this harness_sha256.
+    *(
+        ({name: value}, UV_VARS + name)
+        for name, value in (
+            ("UV_WORKING_DIR", "/tmp"), ("UV_PROJECT", "/tmp"), ("UV_PROJECT_ENVIRONMENT", "/tmp/venv"), ("UV_NO_SYNC", "1"),
+            ("UV_FROZEN", "1"), ("UV_NO_EDITABLE", "1"), ("UV_CONFIG_FILE", "/tmp/uv.toml"), ("UV_NO_PROJECT", "1"),
+            ("UV_PYTHON", "3.14"), ("UV_ISOLATED", "1"), ("UV_", ""),
+        )
+    ),
+    ({"UV_PROJECT": "/tmp", "UV_NO_SYNC": "1", "UV_CACHE_DIR": "/tmp/c"}, UV_VARS + "UV_NO_SYNC UV_PROJECT\n"),
     (mock(model="anthropic/claude-haiku-5-5"), MODEL_MUST),
     (mock(model="mockllm/other"), MODEL_MUST),
     ({"PILOT_MODEL_OVERRIDE": "mockllm/model"}, EPOCHS_MUST),
@@ -436,6 +458,18 @@ REFUSALS = [
         )
     ),
     ({**mock(), "PILOT_EPOCH_OVERRIDE": "2"}, UNREAD + "PILOT_EPOCH_OVERRIDE"),
+    # A mistyped prefix would leave the paid pilot too, so any name holding an override's suffix is refused.
+    *(
+        ({name: value}, UNREAD + name)
+        for name, value in (
+            ("PILTO_MODEL_OVERRIDE", "mockllm/model"), ("PLIOT_EPOCHS_OVERRIDE", "1"), ("PILOTLOG_ROOT", "/tmp/m"),
+            ("MODEL_OVERRIDE", "mockllm/model"), ("EPOCHS_OVERRIDE", "1"), ("LOG_ROOT", "/tmp/m"), ("log_root", "/tmp/m"),
+        )
+    ),
+    (
+        {"PILTO_MODEL_OVERRIDE": "mockllm/model", "PILTO_EPOCHS_OVERRIDE": "1", "PILTO_LOG_ROOT": "/tmp/m"},
+        UNREAD + "PILTO_EPOCHS_OVERRIDE PILTO_LOG_ROOT PILTO_MODEL_OVERRIDE",
+    ),
     # A misspelled AGENTS would be ignored and every part would run, so any name starting with AGENT
     # (ignoring case) other than exactly AGENTS is refused, beside a valid AGENTS or not.
     *(
@@ -493,6 +527,14 @@ def test_agent_inside_a_name_is_not_a_control_variable(fake_root):
     assert [options(argv) for argv in commands] == [
         expected(*run, fake_root["harness"], fake_root["pilot"]) for run in RUNS if run[0] == "sonnet"
     ]
+
+
+def test_the_uv_variables_that_change_no_code_are_allowed(fake_root):
+    """uv run sets UV_RUN_RECURSION_DEPTH for what it runs; the cache, progress and env-file settings change no code."""
+    allowed = {"UV_RUN_RECURSION_DEPTH": "1", "UV_CACHE_DIR": "/tmp/uv-cache", "UV_NO_PROGRESS": "1", "UV_ENV_FILE": "/tmp/x.env", "UV_NO_ENV_FILE": "1"}
+    assert dry_run(fake_root, **allowed) == dry_run(fake_root)
+    # Only a name starting with UV_ is one of uv's settings.
+    assert dry_run(fake_root, UVX="1", MY_UV_X="1") == dry_run(fake_root)
 
 
 def preflight_call(fake: dict, runs: list[tuple[str, str]] = RUNS) -> list[str]:
@@ -577,14 +619,40 @@ def test_preflight_refuses_inspect_options_in_the_env_file(fake_root):
     assert uv_calls(fake_root) == [preflight_call(fake_root)]
 
 
+def test_preflight_refuses_every_inspect_variable_in_the_env_file_but_the_display_ones(fake_root):
+    """A log format of json would write logs scripts/main_status.py's spend check cannot count, so any INSPECT_* key but the
+    display ones is refused."""
+    dotenv_file = fake_root["root"] / ".env"
+    dotenv_file.write_text("INSPECT_DISPLAY=plain\nINSPECT_LOG_FORMAT=json\nINSPECT_NO_ANSI=1\nINSPECT_CACHE_DIR=/tmp/c\n")
+    result = run_script({**fake_root["env"], "FAKE_UV_RUN_PREFLIGHT": "1"}, script=fake_root["script"])
+    assert result.returncode == 2, result.stderr
+    assert f"remove these Inspect option variables from {dotenv_file} first: INSPECT_CACHE_DIR INSPECT_LOG_FORMAT\n" in result.stderr
+    assert "nothing was run" in result.stderr
+    assert uv_calls(fake_root) == [preflight_call(fake_root)]
+
+
+def test_preflight_reads_the_env_file_as_python_dotenv_does(fake_root):
+    """python-dotenv, which Inspect loads .env with, strips a leading byte order mark, so the key after it counts."""
+    dotenv_file = fake_root["root"] / ".env"
+    dotenv_file.write_text("\ufeffINSPECT_LOG_FORMAT=json\nFOO=1\nINSPECT_EVAL_NO_VALUE\n", encoding="utf-8")
+    assert sorted(key for key, value in dotenv_values(dotenv_file).items() if value is not None) == ["FOO", "INSPECT_LOG_FORMAT"]
+    result = run_script({**fake_root["env"], "FAKE_UV_RUN_PREFLIGHT": "1"}, script=fake_root["script"])
+    assert result.returncode == 2, result.stderr
+    assert f"remove these Inspect option variables from {dotenv_file} first: INSPECT_LOG_FORMAT\n" in result.stderr
+    assert "json" not in result.stderr.replace(str(dotenv_file), "")
+    assert uv_calls(fake_root) == [preflight_call(fake_root)]
+
+
 def test_preflight_refuses_inspect_options_that_uv_adds(fake_root):
     """The preflight runs under the same uv options as every eval-set, so it refuses what uv would add to them."""
     (fake_root["root"] / ".env").touch()
-    added = json.dumps({"INSPECT_EVAL_FALLBACK_MODELS": "anthropic/claude-sonnet-5-5"})
+    added = json.dumps(
+        {"INSPECT_EVAL_FALLBACK_MODELS": "anthropic/claude-sonnet-5-5", "INSPECT_LOG_FORMAT": "json", "INSPECT_DISPLAY": "plain"}
+    )
     env = {**fake_root["env"], "FAKE_UV_RUN_PREFLIGHT": "1", "FAKE_UV_PREFLIGHT_ENV": added}
     result = run_script(env, script=fake_root["script"])
     assert result.returncode == 2, result.stderr
-    assert "unset these Inspect option variables first: INSPECT_EVAL_FALLBACK_MODELS" in result.stderr
+    assert "unset these Inspect option variables first: INSPECT_EVAL_FALLBACK_MODELS INSPECT_LOG_FORMAT\n" in result.stderr
     assert "nothing was run" in result.stderr
     assert uv_calls(fake_root) == [preflight_call(fake_root)]
 
@@ -701,7 +769,7 @@ def test_a_part_logged_under_another_harness_is_refused(fake_root, recorded):
     found = ", ".join(sorted([str(recorded), fake_root["harness"]]))
     assert f"eval-set would reuse: {pilot}/gpt-oss-conflict (harness_sha256 {found});" in result.stderr
     assert "haiku-normal" not in result.stderr
-    assert "move each one out of the log root (for example into logs/pilot-rejected/)" in result.stderr
+    assert "move each one into logs/pilot-rejected/ and re-run" in result.stderr
     assert "nothing was run" in result.stderr
     assert uv_calls(fake_root) == [preflight_call(fake_root)]
 
@@ -906,7 +974,7 @@ def test_a_harness_edit_during_a_part_fails_loudly(fake_root, edited):
     result = run_script(env, script=fake_root["script"])
     assert result.returncode == 1, result.stderr
     assert "changed while gpt-oss normal ran (exit 0)" in result.stderr
-    assert f"move {fake_root['pilot']}/gpt-oss-normal out of the log root" in result.stderr
+    assert f"move {fake_root['pilot']}/gpt-oss-normal into logs/pilot-rejected/ before resuming" in result.stderr
     assert 'AGENTS="gpt-oss sonnet"' in result.stderr
     calls = uv_calls(fake_root)
     assert calls[0] == preflight_call(fake_root)

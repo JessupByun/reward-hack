@@ -290,7 +290,7 @@ def paid_costs(usage: dict[str, ModelUsage], where: str, problems: list[str]) ->
     return costs
 
 
-def read_spend(logs_dir: Path, seen: set[str]) -> dict:
+def read_spend(logs_dir: Path, seen: set[str], model: str | None = None) -> dict:
     """Each paid provider's spend in the .eval logs under logs_dir, from their headers and sample summaries only.
 
     A directory that does not exist holds no logs.
@@ -300,6 +300,8 @@ def read_spend(logs_dir: Path, seen: set[str]) -> dict:
     the header leaves out samples reused from a replaced attempt, and a sample keeps only its final attempt's usage.
     A log with status started never finished, so its header holds no final spend and only the samples it wrote
     count; it and any log that replaced a failed attempt are listed as incomplete, as their spend is a lower bound.
+    model, when given, limits the count to the logs whose header names that model (scripts/main_status.py splits
+    Anthropic spend between Haiku and Sonnet this way); any other log is neither counted nor added to seen.
     """
     found = no_spend() | {"dir": str(logs_dir)}
     if not logs_dir.exists():
@@ -312,6 +314,8 @@ def read_spend(logs_dir: Path, seen: set[str]) -> dict:
             log = read_eval_log(str(path), header_only=True)
         except Exception as e:
             problems.append(f"{path}: cannot be read ({type(e).__name__}: {e})")
+            continue
+        if model is not None and log.eval.model != model:
             continue
         if log.eval.eval_id in seen:
             continue

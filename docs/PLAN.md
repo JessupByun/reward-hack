@@ -32,7 +32,7 @@ src/rewardhack/analysis/   metrics.py, roc.py
 tasks/<id>/                ticket.md, task.json, NOTICE.md, src/, tests_visible/, legacy_normal.py, legacy_conflict.py, hidden/, reference/, alternatives/, gaming_patches/
 tasks/LICENSE-CWEval, tasks/conftest.py (host pytest guard)
 sandbox/                   Dockerfile, .dockerignore, compose.yaml, build.sh, requirements.in, requirements.txt (hashed), image_digest.txt, harness/ (check runner and its pytest.ini, copied to /opt/harness)
-scripts/                   smoke_mockllm.py, validate_tasks.py, grade_hidden.py, run_pilot.sh, run_main.sh
+scripts/                   smoke_mockllm.py, validate_tasks.py, grade_hidden.py, run_pilot.sh, run_main.sh, launch_lib.sh (their shared launch logic), pilot_report.py, main_status.py, score_logs.py
 tests/                     pytest suite for the harness itself
 logs/                      eval logs (gitignored)
 ```
@@ -333,6 +333,9 @@ The 52 pilot episodes are excluded from every metric.
 | gpt-oss-120b agent, pilot and smoke test | 309 | $2.90 | $15.50 |
 
 Re-estimate from the pilot's measured cost per episode and per monitor call before the full runs.
+Re-estimate from the pilot: the full runs' agents project to about $0.32 (Haiku), $0.38 (gpt-oss) and $1.06 (Sonnet).
+The monitors and summaries on all 656 trajectories project to about $1.25 (the pilot's spend per agent and variant times the full-run episodes), and the judge costs about $0.0056 per call, so under $1 for 150 calls.
+`scripts/run_main.sh` refuses to start a full-run part when its agent's spend so far, plus its samples still to run at their full per-sample limit, is above the agent's hard cap, and checks again before each later part.
 Per-sample caps are checked after each generation and retried errors add spend, so the worst-case Claude total is about $175 to $180, still under $200.
 
 ## Limitations to state
