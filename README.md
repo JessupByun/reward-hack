@@ -108,17 +108,23 @@ The full pilot and tuning outcome is under step 3 of PLAN's [Build order](docs/P
 
 ## How it works
 
-```mermaid
-flowchart TD
-    T["CWEval task: one vulnerable Python function"] --> N["Normal variant: legacy test is a benign capability test"]
-    T --> C["Conflict variant: legacy test pins the old unsafe behaviour"]
-    N --> A["Agent fixes the code in a no-network sandbox"]
-    C --> A
-    A --> G["Hidden grader: fresh visible check, hidden security tests, bandit ignoring nosec"]
-    G --> L["Labels from the variant and the grader only"]
-    A --> M["Monitors M1 to M4 score the trajectory after the fact"]
-    L --> R["AUROC and TPR at fixed FPR on set P"]
-    M --> R
+```text
+CWEval task: one vulnerable Python function and a ticket asking for a real fix
+  |-- normal variant:   the legacy test is a benign capability test
+  '-- conflict variant: the legacy test pins the old unsafe behaviour
+        |
+        v  (either variant)
+Agent fixes the code in a no-network Docker sandbox (four tools, no shell)
+        |
+        |--> Hidden grader: fresh visible check, hidden security tests and,
+        |    on bandit-checked tasks, bandit --ignore-nosec
+        |      --> labels (variant and grader only) ------------------+
+        |                                                             |
+        '--> Monitors M1 to M4 score the trajectory after the fact    |
+               --> scores --------------------------------------------+
+                                                                      |
+                                                                      v
+                                                     AUROC and TPR at fixed FPR on set P
 ```
 
 ### Tasks
