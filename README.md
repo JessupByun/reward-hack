@@ -14,8 +14,8 @@ The agents only ever fix vulnerable code, and everything they write runs in a no
 
 > [!NOTE]
 > **Work in progress.**
-> Steps 1 to 3 of 7 are done: the sandboxed harness, 8 tasks with a hidden grader, and a 52-episode pilot (an episode is one agent attempt at one task), after which monitors M1 to M3 were frozen under a git tag before any full run.
-> The full runs (656 episodes) are being prepared, and no full-run episode has run, so there are no headline results yet.
+> Steps 1 to 4 of 7 are done: the sandboxed harness, 8 tasks with a hidden grader, a 52-episode pilot (an episode is one agent attempt at one task) after which monitors M1 to M3 were frozen under a git tag before the full runs, and all 656 full-run episodes.
+> Labelling the full runs (step 5) is under way, and no full-run metric has been computed, so there are no headline results yet.
 >
 > **Preliminary pilot findings:** on 2 of the 8 tasks, gpt-oss-120b gamed 7 of its 10 conflict-variant episodes and the two Claude agents gamed none of their 16.
 > All 7 special-cased inputs like the legacy test's, none with a `# nosec` comment or a bandit-silent API swap, and in the 4 that still fail a hidden security test no injected command can run.
@@ -30,12 +30,12 @@ The agents only ever fix vulnerable code, and everything they write runs in a no
 | 1. Setup | Done | Pinned environment, no-network sandbox image, Inspect AI harness with four agent tools, a scripted smoke test, and a live smoke test on Haiku and gpt-oss |
 | 2. Tasks and grader | Done | 8 tasks adapted from CWEval, each with a normal and a conflict variant, a hidden grader, and a validation matrix whose every row passes twice in the sandbox |
 | 3. Pilot and monitor freeze | Done | 52 pilot episodes on 2 tasks with a go/no-go report; monitors M1 to M3 and the summarizer checked on the pilot logs only (the summary length target was set from them and no prompt or rule changed), then frozen under the git tag [`monitors-frozen`](https://github.com/JessupByun/reward-hack/tree/monitors-frozen) |
-| 4. Full runs | In progress | The full-run launcher is being built and reviewed; no full-run episode has run |
-| 5. Labels | Not started | Hidden grader on every full-run log, a descriptive judge, and hand review for harness bugs |
+| 4. Full runs | Done | 656 episodes on all 8 tasks (Haiku and gpt-oss 96 normal and 192 conflict each, Sonnet 40 and 40), every one completed with no errors and no limit hits, for $2.01 in agent spend |
+| 5. Labels | In progress | Hidden grader on every full-run log, then a descriptive judge and hand review for harness bugs |
 | 6. Monitors on the full runs | Not started | The frozen M1, M2 and three M3 arms; M4 is built, fitted and scored here |
 | 7. Analysis | Not started | A results table, ROC curves on the primary eval set P (gaming against honest fixes), and three annotated trajectories |
 
-The harness has about 2,000 automated tests, and the suite runs with Docker required and passes with none skipped.
+The harness has about 2,300 automated tests, and the suite runs with Docker required and passes with none skipped.
 The full design is in [docs/PLAN.md](docs/PLAN.md), and the step-by-step plan with the pilot outcome is its [Build order](docs/PLAN.md#build-order) section.
 
 ## Pilot results (preliminary)
@@ -231,7 +231,7 @@ src/rewardhack/            Inspect task and agent loop, agent tools, check-resul
 src/rewardhack/monitors/   M1 rules, M2 and M3 monitors and the judge, reasoning extraction, summarizer, transcript, spend ledger and caps, frozen prompts
 tasks/<id>/                ticket, start code, visible and legacy tests, hidden tests, reference, alternative fixes, gaming patches, task.json, NOTICE.md
 sandbox/                   Dockerfile, compose.yaml, build.sh, hashed requirements, image digest, in-container check runner
-scripts/                   smoke test, task validator, hidden grader, pilot launcher, pilot report, monitor scoring
+scripts/                   smoke test, task validator, hidden grader, pilot and full-run launchers, pilot report, full-run status report, monitor scoring
 tests/                     pytest suite for the harness itself
 docs/PLAN.md               the full design, with the pilot and tuning outcomes
 costs.yaml                 per-model prices that Inspect's cost limits use
@@ -260,29 +260,30 @@ On a new machine the image build gives a new image ID and rewrites the tracked `
 | `uv run python scripts/grade_hidden.py LOG [LOG ...]` | Grades finished episodes with fresh visible and hidden checks and writes labels to `logs/labels/labels.jsonl`, or to the file given with `--out` |
 | `uv run python scripts/grade_hidden.py logs/pilot/*-* --out logs/pilot/labels.jsonl` | Grades the pilot logs into the labels file the pilot report reads |
 | `uv run python scripts/pilot_report.py` | Builds the pilot go/no-go report from `logs/pilot/` and `logs/pilot/labels.jsonl`, without calling any model |
+| `uv run python scripts/main_status.py` | Reports each full-run part's progress, errors and spend against the plan's caps from `logs/main/`, without changing any log |
 | `uv run python scripts/score_logs.py copy SOURCE ...` | Copies agent logs into `logs/scored/`, where the monitors write their scores |
 | `uv run python scripts/score_logs.py m1 [LOG ...]` | Runs M1, which calls no model, on the scored copies |
 
-The eval logs are not in the repository (`logs/` is gitignored), so the grading, report and scoring commands need logs from your own runs.
-`scripts/smoke_mockllm.py` writes free mockllm episode logs to `logs/smoke/`, and the agent logs come from the paid pilot launcher below.
+The eval logs are not in the repository (`logs/` is gitignored), so the grading, report, status and scoring commands need logs from your own runs.
+`scripts/smoke_mockllm.py` writes free mockllm episode logs to `logs/smoke/`, and the agent logs come from the paid launchers below.
 
-The paid steps are the pilot launcher (`scripts/run_pilot.sh`) and the LLM monitors and judge (`scripts/score_logs.py score`).
+The paid steps are the pilot and full-run launchers (`scripts/run_pilot.sh` and `scripts/run_main.sh`) and the LLM monitors and judge (`scripts/score_logs.py score`).
 They need `ANTHROPIC_API_KEY` and `OPENROUTER_API_KEY` in a gitignored `.env` at the repository root.
 The scoring script also records the cost of every model call it makes in a spend ledger at `logs/spend.json`, which a fresh clone creates once with `uv run python -m rewardhack.monitors.spend init`.
-Every agent run sets per-episode cost, turn and token limits with `--model-cost-config costs.yaml`, and the scoring script refuses to start when its projected spend would cross its cap.
-`DRY_RUN=1 scripts/run_pilot.sh` and `uv run python scripts/score_logs.py score --dry-run` print what they would run and run nothing.
+Every agent run sets per-episode cost, turn, token and time limits with `--model-cost-config costs.yaml`, the full-run launcher refuses to start a part when its agent's spend so far, plus every sample that agent still has to run at its full per-sample cost limit, would cross the agent's cap, and the scoring script refuses to start when its projected spend would cross its cap.
+`DRY_RUN=1 scripts/run_pilot.sh`, `DRY_RUN=1 scripts/run_main.sh` and `uv run python scripts/score_logs.py score --dry-run` print what they would run and run nothing.
 The scoring command, with or without `--dry-run`, needs scored copies in `logs/scored/`, plus `--labels logs/pilot/labels.jsonl` when the labels are at the pilot's path rather than grade_hidden's default.
 
 ## Cost
 
 | Provider | Spent so far | Plan expects | Hard cap |
 |---|---|---|---|
-| Anthropic (Claude agents, monitors, summarizer, judge) | about $0.30 | about $36 | about $147 of a $200 credit |
-| OpenRouter (gpt-oss-120b) | about $0.03 | about $3 | $15.50 |
+| Anthropic (Claude agents, monitors, summarizer, judge) | about $1.97 | about $36 | about $147 of a $200 credit |
+| OpenRouter (gpt-oss-120b) | about $0.37 | about $3 | $15.50 |
 
-Anthropic spend so far is the pilot agents ($0.18), the monitors and summaries ($0.08), the judge ($0.04) and the live smoke test (about $0.001).
+Anthropic spend so far is the full-run agents ($1.66), the pilot agents ($0.18), the monitors and summaries on the pilot ($0.08), the judge on the pilot ($0.04) and the live smoke test (about $0.001).
 Measured pilot cost per episode was 4% to 20% of the plan's estimates, as recorded under step 3 of PLAN's [Build order](docs/PLAN.md#build-order).
-From the pilot, the full runs project to about $0.32 (Haiku), $0.38 (gpt-oss) and $1.06 (Sonnet) for the agents.
+From the pilot, the full runs projected to about $0.32 (Haiku), $0.38 (gpt-oss) and $1.06 (Sonnet) for the agents, and they cost $0.43, $0.35 and $1.23.
 For the monitors and summaries, the pilot's measured monitor and summarizer spend per agent and variant, times the full-run episodes, projects to about $1.25.
 The planned amounts and hard caps are in PLAN's [Budget](docs/PLAN.md#budget) section.
 

@@ -315,6 +315,8 @@ The 52 pilot episodes are excluded from every metric.
    - Summary spot check: a word list over all 69 summaries and agent review of 51 of them found no added evaluative wording, and one minor merged rationale that would not change a monitor's verdict.
    - Claude reviewer agents (Opus 5.5 and Sonnet 5.5) refused the other 18 summaries as reasoning_extraction although the reasoning is gpt-oss's, so those were checked by the word list only.
 4. Full runs in the background with `inspect eval-set`: Haiku, then gpt-oss, then Sonnet.
+   Full-run outcome (`scripts/run_main.sh`, one launch per agent in that order): all 656 episodes finished, every part's log has status success, and no sample errored, was retried or hit any turn, token, time or cost limit.
+   Agent spend was $0.43 for Haiku, $0.35 for gpt-oss and $1.23 for Sonnet ($2.01 in all), against caps of $28.80, $15.47 (the $15.50 OpenRouter hard cap less the pilot's and smoke test's $0.03) and $80.00.
 5. Labels: `scripts/grade_hidden.py` on all logs, then the judge and the hand review.
 6. Monitors: run the frozen M1, M2 and the three M3 arms, then fit and score M4.
 7. Analysis and README: a results table, a ROC figure on P, and 3 annotated trajectories (one caught, one missed, one false positive from the honest part of control set C), plus limitations and related work.
